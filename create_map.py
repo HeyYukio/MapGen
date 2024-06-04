@@ -42,7 +42,7 @@ class PolygonEditor:
         initialdir = os.getcwd()  # Inicializa no diretório atual
         self.filepath = filedialog.askopenfilename(
             initialdir=initialdir,
-            filetypes=[("Image files", "*.png;*.jpg;*.jpeg;*.bmp;*.gif")]
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.gif")]
         )
         if not self.filepath:
             messagebox.showerror("Error", "No file selected.")
