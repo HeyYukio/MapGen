@@ -6,7 +6,7 @@ import tkinter as tk
 from tkinter import filedialog, simpledialog, messagebox
 from tkinter import ttk
 from ttkthemes import ThemedTk
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 
 class PolygonEditor:
     def __init__(self, root):
@@ -31,15 +31,16 @@ class PolygonEditor:
         self.load_image()
 
         self.canvas.bind("<Button-1>", self.on_left_click)
-        self.canvas.bind("<Motion>", self.on_mouse_move)
-        self.canvas.bind("<ButtonRelease-1>", self.on_left_release)
+        self.canvas.bind("<B3-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-3>", self.on_right_release)
         self.root.bind("<Control-z>", self.undo_action)
         self.root.bind("<Return>", self.on_enter)
+        self.root.bind("<Control-s>", self.save_and_restart)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def load_image(self):
-        initialdir = os.getcwd()  # Inicializa no diretório atual
+        initialdir = os.getcwd()
         self.filepath = filedialog.askopenfilename(
             initialdir=initialdir,
             filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.gif")]
@@ -78,6 +79,7 @@ class PolygonEditor:
                 self.canvas.create_polygon(points, outline='green', fill='', width=2)
             for point in points:
                 self.canvas.create_oval(point[0]-3, point[1]-3, point[0]+3, point[1]+3, fill='red')
+            self.canvas.create_text(points[0][0], points[0][1] - 10, text=f"{polygon['label']} ({polygon['identifier']})", fill="blue")
 
         if self.drawing and len(self.current_polygon) > 0:
             points = self.current_polygon
@@ -88,14 +90,6 @@ class PolygonEditor:
 
     def on_left_click(self, event):
         if not self.drawing:
-            for i, polygon in enumerate(self.polygons):
-                for j, point in enumerate(polygon['points']):
-                    if abs(point[0] - event.x) < 5 and abs(point[1] - event.y) < 5:
-                        self.moving_point = True
-                        self.selected_point_index = j
-                        self.selected_polygon_index = i
-                        self.action_history.append(('move_start', self.selected_polygon_index, self.selected_point_index, point))
-                        return
             self.drawing = True
             self.current_polygon = [(event.x, event.y)]
             self.action_history.append(('start_polygon', self.current_polygon.copy()))
@@ -111,14 +105,34 @@ class PolygonEditor:
             self.action_history.append(('add_point', (event.x, event.y)))
         self.redraw()
 
-    def on_mouse_move(self, event):
+    def on_mouse_drag(self, event):
+        if not self.moving_point:
+            for i, polygon in enumerate(self.polygons):
+                for j, point in enumerate(polygon['points']):
+                    if abs(point[0] - event.x) < 5 and abs(point[1] - event.y) < 5:
+                        self.moving_point = True
+                        self.selected_point_index = j
+                        self.selected_polygon_index = i
+                        self.action_history.append(('move_start', self.selected_polygon_index, self.selected_point_index, point))
+                        return
+            for j, point in enumerate(self.current_polygon):
+                if abs(point[0] - event.x) < 5 and abs(point[1] - event.y) < 5:
+                    self.moving_point = True
+                    self.selected_point_index = j
+                    self.selected_polygon_index = -1
+                    self.action_history.append(('move_start', self.selected_polygon_index, self.selected_point_index, point))
+                    return
         if self.moving_point:
-            old_point = self.polygons[self.selected_polygon_index]['points'][self.selected_point_index]
-            self.polygons[self.selected_polygon_index]['points'][self.selected_point_index] = (event.x, event.y)
+            if self.selected_polygon_index == -1:
+                old_point = self.current_polygon[self.selected_point_index]
+                self.current_polygon[self.selected_point_index] = (event.x, event.y)
+            else:
+                old_point = self.polygons[self.selected_polygon_index]['points'][self.selected_point_index]
+                self.polygons[self.selected_polygon_index]['points'][self.selected_point_index] = (event.x, event.y)
             self.action_history.append(('move_point', self.selected_polygon_index, self.selected_point_index, old_point))
-        self.redraw()
+            self.redraw()
 
-    def on_left_release(self, event):
+    def on_right_release(self, event):
         if self.moving_point:
             self.moving_point = False
 
@@ -157,13 +171,39 @@ class PolygonEditor:
         elif action[0] == 'add_polygon':
             self.polygons.pop()
         elif action[0] == 'move_start':
-            self.polygons[action[1]]['points'][action[2]] = action[3]
+            if action[1] == -1:
+                self.current_polygon[action[2]] = action[3]
+            else:
+                self.polygons[action[1]]['points'][action[2]] = action[3]
         elif action[0] == 'move_point':
-            self.polygons[action[1]]['points'][action[2]] = action[3]
+            if action[1] == -1:
+                self.current_polygon[action[2]] = action[3]
+            else:
+                self.polygons[action[1]]['points'][action[2]] = action[3]
 
         self.redraw()
 
-    def on_close(self):
+    def save_and_restart(self, event):
+        self.save_polygons()
+        self.polygons = []
+        self.current_polygon = []
+        self.drawing = False
+        self.moving_point = False
+        self.selected_point_index = -1
+        self.selected_polygon_index = -1
+        self.action_history = []
+        self.load_image()
+
+    def save_polygons(self):
+        output_filepath = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+            initialfile="polygons"
+        )
+        if not output_filepath:
+            messagebox.showerror("Error", "No file name provided.")
+            return
+
         output_data = {
             'frame_size': {
                 'width': self.width,
@@ -171,8 +211,23 @@ class PolygonEditor:
             },
             'polygons': self.polygons
         }
-        with open('polygons.json', 'w') as f:
+        with open(output_filepath, 'w') as f:
             json.dump(output_data, f, indent=4)
+        self.save_annotated_image(output_filepath)
+        messagebox.showinfo("Success", f"Polygons saved to {output_filepath}")
+
+    def save_annotated_image(self, json_filepath):
+        annotated_image = self.display_image.copy()
+        draw = ImageDraw.Draw(annotated_image)
+        for polygon in self.polygons:
+            points = polygon['points']
+            draw.polygon(points, outline='green')
+            draw.text((points[0][0], points[0][1] - 10), f"{polygon['label']} ({polygon['identifier']})", fill="blue")
+        annotated_image_filepath = json_filepath.replace('.json', '.png')
+        annotated_image.save(annotated_image_filepath)
+
+    def on_close(self):
+        self.save_polygons()
         self.root.destroy()
 
 if __name__ == "__main__":
