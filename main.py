@@ -7,6 +7,7 @@ from tkinter import filedialog, simpledialog, messagebox
 from tkinter import ttk
 from ttkthemes import ThemedTk
 from PIL import Image, ImageTk, ImageDraw, ImageFont
+import random
 
 class PolygonEditor:
     def __init__(self, root):
@@ -27,6 +28,14 @@ class PolygonEditor:
         self.selected_polygon_index = -1
 
         self.action_history = []
+
+        self.colors = [
+            'red', 'blue', 'green', 'yellow', 'purple', 'orange',
+            'cyan', 'magenta', 'lime', 'pink', 'teal', 'lavender',
+            'brown', 'beige', 'maroon', 'olive', 'coral', 'navy', 'grey'
+        ]
+        
+        random.shuffle(self.colors)
 
         self.load_image()
 
@@ -73,20 +82,22 @@ class PolygonEditor:
         self.tk_image = ImageTk.PhotoImage(self.display_image)
         self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
 
-        for polygon in self.polygons:
+        for i, polygon in enumerate(self.polygons):
             points = polygon['points']
+            color = self.colors[i % len(self.colors)]
             if len(points) > 1:
-                self.canvas.create_polygon(points, outline='green', fill='', width=2)
+                self.canvas.create_polygon(points, outline=color, fill='', width=3)
             for point in points:
-                self.canvas.create_oval(point[0]-3, point[1]-3, point[0]+3, point[1]+3, fill='red')
-            self.canvas.create_text(points[0][0], points[0][1] - 10, text=f"{polygon['label']} ({polygon['identifier']})", fill="blue")
+                self.canvas.create_oval(point[0]-3, point[1]-3, point[0]+3, point[1]+3, fill=color)
+            self.canvas.create_text(points[0][0], points[0][1] - 20, text=f"{polygon['label']} ({polygon['identifier']})", fill=color, font=("Arial", 14, "bold"))
 
         if self.drawing and len(self.current_polygon) > 0:
             points = self.current_polygon
+            color = 'blue'
             if len(points) > 1:
-                self.canvas.create_line(points, fill='blue', width=2)
+                self.canvas.create_line(points, fill=color, width=3)
             for point in points:
-                self.canvas.create_oval(point[0]-3, point[1]-3, point[0]+3, point[1]+3, fill='red')
+                self.canvas.create_oval(point[0]-3, point[1]-3, point[0]+3, point[1]+3, fill=color)
 
     def on_left_click(self, event):
         if not self.drawing:
@@ -219,10 +230,13 @@ class PolygonEditor:
     def save_annotated_image(self, json_filepath):
         annotated_image = self.display_image.copy()
         draw = ImageDraw.Draw(annotated_image)
-        for polygon in self.polygons:
+        font = ImageFont.truetype("arial.ttf", 20)  # Change the font size to make annotations more visible
+
+        for i, polygon in self.polygons:
             points = polygon['points']
-            draw.polygon(points, outline='green')
-            draw.text((points[0][0], points[0][1] - 10), f"{polygon['label']} ({polygon['identifier']})", fill="blue")
+            color = self.colors[i % len(self.colors)]
+            draw.polygon(points, outline=color, width=3)
+            draw.text((points[0][0], points[0][1] - 30), f"{polygon['label']} ({polygon['identifier']})", fill=color, font=font)
         annotated_image_filepath = json_filepath.replace('.json', '.png')
         annotated_image.save(annotated_image_filepath)
 
