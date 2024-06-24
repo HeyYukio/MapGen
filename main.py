@@ -29,12 +29,12 @@ class PolygonEditor:
 
         self.action_history = []
 
+        # Lista de cores válidas
         self.colors = [
             'red', 'blue', 'green', 'yellow', 'purple', 'orange',
             'cyan', 'magenta', 'lime', 'pink', 'teal', 'lavender',
             'brown', 'beige', 'maroon', 'olive', 'coral', 'navy', 'grey'
         ]
-        
         random.shuffle(self.colors)
 
         self.load_image()
@@ -52,7 +52,7 @@ class PolygonEditor:
         initialdir = os.getcwd()
         self.filepath = filedialog.askopenfilename(
             initialdir=initialdir,
-            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.gif")]
+            filetypes=[("Image files", "*.png *.jpg *.jpeg")]
         )
         if not self.filepath:
             messagebox.showerror("Error", "No file selected.")
@@ -89,7 +89,8 @@ class PolygonEditor:
                 self.canvas.create_polygon(points, outline=color, fill='', width=3)
             for point in points:
                 self.canvas.create_oval(point[0]-3, point[1]-3, point[0]+3, point[1]+3, fill=color)
-            self.canvas.create_text(points[0][0], points[0][1] - 20, text=f"{polygon['label']} ({polygon['identifier']})", fill=color, font=("Arial", 14, "bold"))
+            label_pos = self.get_non_overlapping_label_position(points, i)
+            self.canvas.create_text(label_pos[0], label_pos[1], text=f"{polygon['label']} ({polygon['id']})", fill=color, font=("Arial", 14, "bold"))
 
         if self.drawing and len(self.current_polygon) > 0:
             points = self.current_polygon
@@ -100,6 +101,8 @@ class PolygonEditor:
                 self.canvas.create_oval(point[0]-3, point[1]-3, point[0]+3, point[1]+3, fill=color)
 
     def on_left_click(self, event):
+        if event.x < 0 or event.x > self.width or event.y < 0 or event.y > self.height:
+            return
         if not self.drawing:
             self.drawing = True
             self.current_polygon = [(event.x, event.y)]
@@ -117,6 +120,8 @@ class PolygonEditor:
         self.redraw()
 
     def on_mouse_drag(self, event):
+        if event.x < 0 or event.x > self.width or event.y < 0 or event.y > self.height:
+            return
         if not self.moving_point:
             for i, polygon in enumerate(self.polygons):
                 for j, point in enumerate(polygon['points']):
@@ -157,10 +162,10 @@ class PolygonEditor:
         label = simpledialog.askstring("Input", "Enter label for this polygon:")
         if label:
             try:
-                identifier = int(simpledialog.askstring("Input", "Enter identifier for this polygon:"))
+                id = int(simpledialog.askstring("Input", "Enter identifier for this polygon:"))
                 self.polygons.append({
                     'label': label,
-                    'identifier': identifier,
+                    'id': id,
                     'points': self.current_polygon
                 })
                 self.action_history.append(('add_polygon', self.polygons[-1]))
@@ -212,7 +217,7 @@ class PolygonEditor:
             initialfile="polygons"
         )
         if not output_filepath:
-            messagebox.showerror("Error", "No file name provided.")
+            messagebox.showerror("Error", "No file selected for saving.")
             return
 
         output_data = {
@@ -232,13 +237,34 @@ class PolygonEditor:
         draw = ImageDraw.Draw(annotated_image)
         font = ImageFont.truetype("arial.ttf", 20)  # Change the font size to make annotations more visible
 
-        for i, polygon in self.polygons:
+        for i, polygon in enumerate(self.polygons):
             points = polygon['points']
             color = self.colors[i % len(self.colors)]
             draw.polygon(points, outline=color, width=3)
-            draw.text((points[0][0], points[0][1] - 30), f"{polygon['label']} ({polygon['identifier']})", fill=color, font=font)
+            label_pos = self.get_non_overlapping_label_position(points, i)
+            draw.text(label_pos, f"{polygon['label']} ({polygon['id']})", fill=color, font=font)
         annotated_image_filepath = json_filepath.replace('.json', '.png')
         annotated_image.save(annotated_image_filepath)
+
+    def get_non_overlapping_label_position(self, points, polygon_index):
+        offset = 10
+        x, y = points[0]
+        positions = [
+            (x, y - 30), (x + offset, y - 30), (x - offset, y - 30),
+            (x, y + offset), (x + offset, y + offset), (x - offset, y + offset),
+            (x, y + 30), (x + offset, y + 30), (x - offset, y + 30)
+        ]
+
+        for px, py in points:
+            for pos in positions:
+                if abs(px - pos[0]) < offset and abs(py - pos[1]) < offset:
+                    positions.remove(pos)
+
+        for pos in positions:
+            if 0 <= pos[0] <= self.width and 0 <= pos[1] <= self.height:
+                return pos
+
+        return x, y - 30
 
     def on_close(self):
         self.save_polygons()
