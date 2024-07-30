@@ -235,7 +235,8 @@ class PolygonEditor:
     def save_annotated_image(self, json_filepath):
         annotated_image = self.display_image.copy()
         draw = ImageDraw.Draw(annotated_image)
-        font = ImageFont.truetype("arial.ttf", 20)  # Change the font size to make annotations more visible
+        #font = ImageFont.truetype("arial.ttf", 20)  # Change the font size to make annotations more visible
+        font = ImageFont.load_default(size=20)
 
         for i, polygon in enumerate(self.polygons):
             points = polygon['points']
