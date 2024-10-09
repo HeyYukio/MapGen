@@ -7,45 +7,43 @@ from tkinter import filedialog, simpledialog, messagebox
 from tkinter import ttk
 from ttkthemes import ThemedTk
 from PIL import Image, ImageTk, ImageDraw, ImageFont
-import random
 
-class PolygonEditor:
+class ImageEditor:
     def __init__(self, root):
         self.root = root
-        self.root.title("Polygon Editor")
-
+        self.root.title("Image Editor")
         self.style = ttk.Style()
         self.style.theme_use('clam')
 
         self.canvas = tk.Canvas(root, width=800, height=600)
         self.canvas.pack()
 
+        self.mode = None  # Mode: 'polygon' or 'crop'
+        self.image = None
+        self.display_image = None
+        self.filepath = None
+
         self.polygons = []
         self.current_polygon = []
         self.drawing = False
-        self.moving_point = False
-        self.selected_point_index = -1
-        self.selected_polygon_index = -1
 
-        self.action_history = []
-
-        # Lista de cores válidas
-        self.colors = [
-            'red', 'blue', 'green', 'yellow', 'purple', 'orange',
-            'cyan', 'magenta', 'lime', 'pink', 'teal', 'lavender',
-            'brown', 'beige', 'maroon', 'olive', 'coral', 'navy', 'grey'
-        ]
-        random.shuffle(self.colors)
+        self.crop_rect = None
+        self.crop_start_point = None
+        self.crop_dragging = False
+        self.rect_moving = False
+        self.keep_aspect_ratio = tk.BooleanVar()
 
         self.load_image()
 
         self.canvas.bind("<Button-1>", self.on_left_click)
-        self.canvas.bind("<B3-Motion>", self.on_mouse_drag)
-        self.canvas.bind("<ButtonRelease-3>", self.on_right_release)
-        self.root.bind("<Control-z>", self.undo_action)
-        self.root.bind("<Return>", self.on_enter)
-        self.root.bind("<Control-s>", self.save_and_restart)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_mouse_release)
 
+        self.canvas.bind("<Button-3>", self.on_right_click)  # For moving the crop rect
+        self.canvas.bind("<B3-Motion>", self.on_right_drag)  # For dragging with right-click
+        self.canvas.bind("<ButtonRelease-3>", self.on_right_release)
+
+        self.root.bind("<Control-s>", self.save_and_restart)  # Ctrl+S for saving
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def load_image(self):
@@ -59,11 +57,6 @@ class PolygonEditor:
             self.root.destroy()
             return
 
-        if not os.path.exists(self.filepath):
-            messagebox.showerror("Error", f"File not found: {self.filepath}")
-            self.root.destroy()
-            return
-
         self.image = cv2.imread(self.filepath)
         if self.image is None:
             messagebox.showerror("Error", f"Could not read the file: {self.filepath}")
@@ -73,205 +66,183 @@ class PolygonEditor:
         self.image = cv2.cvtColor(self.image, cv2.COLOR_BGR2RGB)
         self.height, self.width, _ = self.image.shape
         self.display_image = Image.fromarray(self.image)
+
+        # Show mode selection window
+        self.show_mode_selection()
+
+    def show_mode_selection(self):
+        # Create a new window for mode selection
+        mode_selection_window = tk.Toplevel(self.root)
+        mode_selection_window.title("Select Mode")
+        mode_selection_window.geometry("300x150")
+
+        label = tk.Label(mode_selection_window, text="Select Mode", font=("Arial", 14))
+        label.pack(pady=20)
+
+        # Add buttons for 'Polygon' and 'Crop' modes
+        polygon_button = tk.Button(
+            mode_selection_window, text="Polygon Mode", command=lambda: self.set_mode('polygon', mode_selection_window)
+        )
+        polygon_button.pack(pady=5)
+
+        crop_button = tk.Button(
+            mode_selection_window, text="Crop Mode", command=lambda: self.set_mode('crop', mode_selection_window)
+        )
+        crop_button.pack(pady=5)
+
+    def set_mode(self, mode, window):
+        self.mode = mode
+        window.destroy()  # Close the mode selection window
+        self.redraw()
+
+        if self.mode == 'crop':
+            self.ask_for_aspect_ratio()
+
+    def ask_for_aspect_ratio(self):
+        response = messagebox.askyesno("Keep Aspect Ratio", "Do you want to maintain the aspect ratio?")
+        self.keep_aspect_ratio.set(response)
+
+    def display_image_on_canvas(self):
         self.tk_image = ImageTk.PhotoImage(self.display_image)
         self.canvas.config(width=self.width, height=self.height)
         self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
 
     def redraw(self):
         self.canvas.delete("all")
-        self.tk_image = ImageTk.PhotoImage(self.display_image)
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
+        self.display_image_on_canvas()
 
-        for i, polygon in enumerate(self.polygons):
-            points = polygon['points']
-            color = self.colors[i % len(self.colors)]
-            if len(points) > 1:
-                self.canvas.create_polygon(points, outline=color, fill='', width=3)
-            for point in points:
-                self.canvas.create_oval(point[0]-3, point[1]-3, point[0]+3, point[1]+3, fill=color)
-            label_pos = self.get_non_overlapping_label_position(points, i)
-            self.canvas.create_text(label_pos[0], label_pos[1], text=f"{polygon['label']} ({polygon['id']})", fill=color, font=("Arial", 14, "bold"))
+        if self.mode == 'polygon':
+            for polygon in self.polygons:
+                self.canvas.create_polygon(polygon, outline='blue', fill='', width=3)
 
-        if self.drawing and len(self.current_polygon) > 0:
-            points = self.current_polygon
-            color = 'blue'
-            if len(points) > 1:
-                self.canvas.create_line(points, fill=color, width=3)
-            for point in points:
-                self.canvas.create_oval(point[0]-3, point[1]-3, point[0]+3, point[1]+3, fill=color)
+        elif self.mode == 'crop' and self.crop_rect:
+            x1, y1, x2, y2 = self.crop_rect
+            self.canvas.create_rectangle(x1, y1, x2, y2, outline="red", width=3)
 
     def on_left_click(self, event):
-        if event.x < 0 or event.x > self.width or event.y < 0 or event.y > self.height:
-            return
-        if not self.drawing:
-            self.drawing = True
-            self.current_polygon = [(event.x, event.y)]
-            self.action_history.append(('start_polygon', self.current_polygon.copy()))
-        else:
-            for point in self.current_polygon:
-                if abs(point[0] - event.x) < 5 and abs(point[1] - event.y) < 5:
-                    if len(self.current_polygon) > 2:
-                        self.drawing = False
-                        self.add_polygon()
-                    self.redraw()
-                    return
+        if self.mode == 'polygon':
             self.current_polygon.append((event.x, event.y))
-            self.action_history.append(('add_point', (event.x, event.y)))
-        self.redraw()
+            if len(self.current_polygon) > 1:
+                self.canvas.create_line(self.current_polygon[-2], self.current_polygon[-1], fill='blue', width=3)
+
+        elif self.mode == 'crop':
+            self.crop_start_point = (event.x, event.y)
 
     def on_mouse_drag(self, event):
-        if event.x < 0 or event.x > self.width or event.y < 0 or event.y > self.height:
-            return
-        if not self.moving_point:
-            for i, polygon in enumerate(self.polygons):
-                for j, point in enumerate(polygon['points']):
-                    if abs(point[0] - event.x) < 5 and abs(point[1] - event.y) < 5:
-                        self.moving_point = True
-                        self.selected_point_index = j
-                        self.selected_polygon_index = i
-                        self.action_history.append(('move_start', self.selected_polygon_index, self.selected_point_index, point))
-                        return
-            for j, point in enumerate(self.current_polygon):
-                if abs(point[0] - event.x) < 5 and abs(point[1] - event.y) < 5:
-                    self.moving_point = True
-                    self.selected_point_index = j
-                    self.selected_polygon_index = -1
-                    self.action_history.append(('move_start', self.selected_polygon_index, self.selected_point_index, point))
-                    return
-        if self.moving_point:
-            if self.selected_polygon_index == -1:
-                old_point = self.current_polygon[self.selected_point_index]
-                self.current_polygon[self.selected_point_index] = (event.x, event.y)
-            else:
-                old_point = self.polygons[self.selected_polygon_index]['points'][self.selected_point_index]
-                self.polygons[self.selected_polygon_index]['points'][self.selected_point_index] = (event.x, event.y)
-            self.action_history.append(('move_point', self.selected_polygon_index, self.selected_point_index, old_point))
+        if self.mode == 'crop' and self.crop_start_point:
+            x1, y1 = self.crop_start_point
+            x2, y2 = event.x, event.y
+
+            if self.keep_aspect_ratio.get():
+                aspect_ratio = self.width / self.height
+                new_width = abs(x2 - x1)
+                new_height = int(new_width / aspect_ratio)
+
+                if y2 < y1:
+                    y2 = y1 - new_height
+                else:
+                    y2 = y1 + new_height
+
+            self.crop_rect = (x1, y1, x2, y2)
+            self.redraw()
+
+    def on_mouse_release(self, event):
+        if self.mode == 'crop' and self.crop_rect:
+            self.crop_dragging = False  # Finish dragging
+
+    def on_right_click(self, event):
+        # If in crop mode, check if the click is inside the crop rect
+        if self.mode == 'crop' and self.crop_rect:
+            x1, y1, x2, y2 = self.crop_rect
+            if x1 < event.x < x2 and y1 < event.y < y2:  # Check if right-click is inside the rectangle
+                self.rect_moving = True
+                self.rect_move_offset = (event.x - x1, event.y - y1)  # Store offset for dragging
+
+    def on_right_drag(self, event):
+        if self.mode == 'crop' and self.rect_moving:
+            # Calculate new position based on the drag offset
+            offset_x, offset_y = self.rect_move_offset
+            x1 = event.x - offset_x
+            y1 = event.y - offset_y
+            x2 = x1 + (self.crop_rect[2] - self.crop_rect[0])
+            y2 = y1 + (self.crop_rect[3] - self.crop_rect[1])
+
+            # Ensure the rectangle stays within image bounds
+            if x1 < 0:
+                x1, x2 = 0, x2 - x1
+            if y1 < 0:
+                y1, y2 = 0, y2 - y1
+            if x2 > self.width:
+                x1, x2 = self.width - (x2 - x1), self.width
+            if y2 > self.height:
+                y1, y2 = self.height - (y2 - y1), self.height
+
+            self.crop_rect = (x1, y1, x2, y2)
             self.redraw()
 
     def on_right_release(self, event):
-        if self.moving_point:
-            self.moving_point = False
+        if self.mode == 'crop':
+            self.rect_moving = False  # Stop moving the rectangle
 
-    def on_enter(self, event):
-        if self.drawing and len(self.current_polygon) > 2:
-            self.drawing = False
-            self.add_polygon()
-        self.redraw()
+    def save_crop(self):
+        if self.crop_rect:
+            x1, y1, x2, y2 = self.crop_rect
 
-    def add_polygon(self):
-        label = simpledialog.askstring("Input", "Enter label for this polygon:")
-        if label:
-            try:
-                id = int(simpledialog.askstring("Input", "Enter identifier for this polygon:"))
-                self.polygons.append({
-                    'label': label,
-                    'id': id,
-                    'points': self.current_polygon
-                })
-                self.action_history.append(('add_polygon', self.polygons[-1]))
-            except ValueError:
-                messagebox.showerror("Invalid input", "Identifier must be a number.")
-        self.current_polygon = []
+            # Ensure coordinates are in the correct order
+            x1, x2 = sorted([x1, x2])
+            y1, y2 = sorted([y1, y2])
 
-    def undo_action(self, event):
-        if not self.action_history:
-            return
+            # Crop image
+            cropped_image = self.display_image.crop((x1, y1, x2, y2))
+            cropped_filepath = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG files", "*.png")])
 
-        action = self.action_history.pop()
+            if cropped_filepath:
+                cropped_image.save(cropped_filepath)
 
-        if action[0] == 'start_polygon':
-            self.current_polygon = []
-            self.drawing = False
-        elif action[0] == 'add_point':
-            self.current_polygon.pop()
-        elif action[0] == 'add_polygon':
-            self.polygons.pop()
-        elif action[0] == 'move_start':
-            if action[1] == -1:
-                self.current_polygon[action[2]] = action[3]
-            else:
-                self.polygons[action[1]]['points'][action[2]] = action[3]
-        elif action[0] == 'move_point':
-            if action[1] == -1:
-                self.current_polygon[action[2]] = action[3]
-            else:
-                self.polygons[action[1]]['points'][action[2]] = action[3]
+                # Save JSON with original dimensions and crop coordinates
+                json_filepath = cropped_filepath.replace('.png', '.json')
+                crop_data = {
+                    "original_size": {"width": self.width, "height": self.height},
+                    "crop_coordinates": {
+                        "x1": x1, "y1": y1,
+                        "x2": x2, "y2": y2
+                    }
+                }
 
-        self.redraw()
+                with open(json_filepath, 'w') as f:
+                    json.dump(crop_data, f, indent=4)
 
-    def save_and_restart(self, event):
-        self.save_polygons()
+                messagebox.showinfo("Crop Saved", f"Cropped image saved at {cropped_filepath} and JSON saved at {json_filepath}")
+
+            # Reset crop
+            self.crop_rect = None
+            self.redraw()
+
+    def save_and_restart(self, event=None):
+        if self.mode == 'crop':
+            self.save_crop()
+        elif self.mode == 'polygon':
+            json_filepath = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
+            if json_filepath:
+                with open(json_filepath, 'w') as f:
+                    json.dump(self.polygons, f, indent=4)
+                messagebox.showinfo("Polygons Saved", f"Polygons saved at {json_filepath}")
+
+        # Reset the editor state
         self.polygons = []
         self.current_polygon = []
         self.drawing = False
-        self.moving_point = False
-        self.selected_point_index = -1
-        self.selected_polygon_index = -1
-        self.action_history = []
+        self.crop_rect = None
         self.load_image()
 
-    def save_polygons(self):
-        output_filepath = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json")],
-            initialfile="polygons"
-        )
-        if not output_filepath:
-            messagebox.showerror("Error", "No file selected for saving.")
-            return
-
-        output_data = {
-            'frame_size': {
-                'width': self.width,
-                'height': self.height
-            },
-            'polygons': self.polygons
-        }
-        with open(output_filepath, 'w') as f:
-            json.dump(output_data, f, indent=4)
-        self.save_annotated_image(output_filepath)
-        messagebox.showinfo("Success", f"Polygons saved to {output_filepath}")
-
-    def save_annotated_image(self, json_filepath):
-        annotated_image = self.display_image.copy()
-        draw = ImageDraw.Draw(annotated_image)
-        #font = ImageFont.truetype("arial.ttf", 20)  # Change the font size to make annotations more visible
-        font = ImageFont.load_default(size=20)
-
-        for i, polygon in enumerate(self.polygons):
-            points = polygon['points']
-            color = self.colors[i % len(self.colors)]
-            draw.polygon(points, outline=color, width=3)
-            label_pos = self.get_non_overlapping_label_position(points, i)
-            draw.text(label_pos, f"{polygon['label']} ({polygon['id']})", fill=color, font=font)
-        annotated_image_filepath = json_filepath.replace('.json', '.png')
-        annotated_image.save(annotated_image_filepath)
-
-    def get_non_overlapping_label_position(self, points, polygon_index):
-        offset = 10
-        x, y = points[0]
-        positions = [
-            (x, y - 30), (x + offset, y - 30), (x - offset, y - 30),
-            (x, y + offset), (x + offset, y + offset), (x - offset, y + offset),
-            (x, y + 30), (x + offset, y + 30), (x - offset, y + 30)
-        ]
-
-        for px, py in points:
-            for pos in positions:
-                if abs(px - pos[0]) < offset and abs(py - pos[1]) < offset:
-                    positions.remove(pos)
-
-        for pos in positions:
-            if 0 <= pos[0] <= self.width and 0 <= pos[1] <= self.height:
-                return pos
-
-        return x, y - 30
-
     def on_close(self):
-        self.save_polygons()
-        self.root.destroy()
+        try:
+            self.root.destroy()  # Ensures graceful shutdown without errors
+        except Exception as e:
+            print(f"Error closing application: {e}")
+            self.root.quit()
 
 if __name__ == "__main__":
-    root = ThemedTk(theme="arc")
-    app = PolygonEditor(root)
+    root = ThemedTk(theme="clam")
+    editor = ImageEditor(root)
     root.mainloop()
