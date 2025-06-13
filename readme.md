@@ -1,18 +1,18 @@
-#  F-MAP Super Deluxe Edition (just kidding pre-alpha)
+# Map Editor
 
+Uma aplicação desktop para anotação de polígonos e recorte de imagens com exportação de metadados.
 
-## Requirements 
+## Recursos Principais
+- 🖼️ Anotação de polígonos com labels e IDs
+- ✂️ Recorte de imagens com controle de proporção
+- 📝 Exportação de metadados em JSON
+- ⏪ Sistema de histórico (Ctrl+Z)
 
-1. Python
-2. OpenCV
-3. Tkinter
-
-
-## How to use 
-
-1. Run main.py
-2. Select the frame to be mapped
-3. Use the Left-Click to draw the polygon and press Enter to finish it 
-4. Enter a label and indentifier for the polygon 
-5. Close the window to save the map
-
+## Instalação
+1. Instale as dependências:
+```bash
+pip install -r requirements.txt
+```
+## Comandos
+- Ctrl+Z: desfaz alteração
+- Ctrl+S: Salva e finaliza edição
