@@ -5,7 +5,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 from tkinter import ttk
 from ttkthemes import ThemedTk
-from PIL import Image, ImageTk, ImageOps
+from PIL import Image, ImageTk, ImageOps, ImageDraw, ImageFont
 import numpy as np
 from typing import List, Tuple, Optional, Dict, Any, Deque
 from collections import deque
@@ -64,6 +64,8 @@ class ImageEditor:
         self.next_polygon_id = 1  # Contador para IDs de polígonos
         self.next_color_index = 0  # Índice para cores de polígonos
         self.selected_polygon_index = None  # Polígono selecionado para remoção
+        self.view_mode = tk.BooleanVar(value=False)  # Modo visualização (oculta pontos)
+        self.edit_mode = False  # Modo de edição para arrastar pontos
 
         self.setup_ui()
         self.setup_bindings()
@@ -138,6 +140,30 @@ class ImageEditor:
             command=self.reset_annotations,
             width=10
         ).pack(side=tk.LEFT, padx=5, pady=2)
+
+        ttk.Button(
+            self.toolbar,
+            text="Exportar Imagem",
+            command=self.export_clean_image,
+            width=12
+        ).pack(side=tk.LEFT, padx=5, pady=2)
+        
+        # Modo visualização
+        ttk.Checkbutton(
+            self.toolbar,
+            text="Modo Visualização",
+            variable=self.view_mode,
+            command=self.toggle_view_mode
+        ).pack(side=tk.LEFT, padx=5, pady=2)
+        
+        # Botão para modo de edição
+        self.edit_mode_button = ttk.Button(
+            self.toolbar,
+            text="Editar Polígonos",
+            command=self.toggle_edit_mode,
+            width=15
+        )
+        self.edit_mode_button.pack(side=tk.LEFT, padx=5, pady=2)
         
         # Indicador de modo
         self.mode_indicator = ttk.Label(
@@ -147,6 +173,28 @@ class ImageEditor:
             font=("Arial", 10, "bold")
         )
         self.mode_indicator.pack(side=tk.RIGHT, padx=10)
+
+    def toggle_edit_mode(self):
+        """Ativa/desativa o modo de edição de polígonos"""
+        self.edit_mode = not self.edit_mode
+        if self.edit_mode:
+            self.edit_mode_button.config(style="Accent.TButton")
+            self.update_status("Modo edição: Clique e arraste para mover pontos")
+        else:
+            self.edit_mode_button.config(style="TButton")
+            # Limpa qualquer estado de arraste ao sair do modo edição
+            self.dragging_point = None
+            self.dragging_polygon = None
+            self.update_status("Modo edição desativado")
+        self.redraw()
+
+    def toggle_view_mode(self):
+        """Alterna entre modo edição e visualização"""
+        self.redraw()
+        if self.view_mode.get():
+            self.update_status("Modo visualização: pontos ocultos")
+        else:
+            self.update_status("Modo edição: pontos visíveis")
 
     def setup_bindings(self):
         """Configura todos os bindings de eventos"""
@@ -162,17 +210,30 @@ class ImageEditor:
         self.root.bind("<Delete>", self.delete_selected)
         self.root.bind("<Control-z>", self.undo_action)
         self.root.bind("<Control-o>", self.load_image)
+        self.root.bind("<KeyPress-v>", self.toggle_view_mode_key)
+        self.root.bind("<KeyPress-e>", self.toggle_edit_mode_key)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
         self.canvas.bind("<Motion>", self.on_mouse_move)
         self.canvas.bind("<Button-2>", self.start_pan)  # Botão do meio do mouse
         self.canvas.bind("<B2-Motion>", self.on_pan)
 
+    def toggle_edit_mode_key(self, event=None):
+        """Atalho para toggle de modo edição"""
+        self.toggle_edit_mode()
+
+    def toggle_view_mode_key(self, event=None):
+        """Atalho para toggle de visualização"""
+        self.view_mode.set(not self.view_mode.get())
+        self.toggle_view_mode()
+
     def update_status(self, message: str):
         """Atualiza a barra de status"""
         mode_text = f"Modo: {self.mode.capitalize()}" if self.mode else "Modo: Nenhum"
         img_text = f"Imagem: {os.path.basename(self.filepath)}" if self.filepath else "Imagem: Nenhuma"
-        self.status_bar.config(text=f"{message} | {mode_text} | {img_text}")
+        view_text = "Visualização" if self.view_mode.get() else "Edição"
+        edit_text = " | Editando" if self.edit_mode else ""
+        self.status_bar.config(text=f"{message} | {mode_text} | {img_text} | {view_text}{edit_text}")
 
     def toggle_zoom(self):
         """Ativa/desativa o modo zoom"""
@@ -329,6 +390,7 @@ class ImageEditor:
         self.selected_polygon_index = None
         self.next_polygon_id = 1
         self.next_color_index = 0
+        self.edit_mode = False
         self.redraw()
         self.update_status("Anotações limpas")
 
@@ -348,7 +410,7 @@ class ImageEditor:
     def undo_action(self, event=None):
         """Desfaz a última ação"""
         if not self.action_history:
-            self.update_status("Nada para desfazer")
+            self.update_status("Nada para desfeito")
             return
             
         # Restaura o estado anterior
@@ -420,11 +482,15 @@ class ImageEditor:
             poly_id = polygon_data['id']
             color = polygon_data['color']
             
-            # Destaca o polígono selecionado
-            outline_width = 4 if idx == self.selected_polygon_index else 2
-            outline_color = "#FFFF00" if idx == self.selected_polygon_index else color
+            # Aplica scale factor se necessário
+            if self.scale_factor != 1.0:
+                points = [(x * self.scale_factor, y * self.scale_factor) for x, y in points]
             
-            # Desenha o polígono
+            # Destaca polígono selecionado apenas no modo edição
+            outline_width = 4 if (idx == self.selected_polygon_index and not self.view_mode.get()) else 3
+            outline_color = "#FFFF00" if (idx == self.selected_polygon_index and not self.view_mode.get()) else color
+            
+            # Desenha o polígono principal
             self.canvas.create_polygon(
                 points, 
                 outline=outline_color, 
@@ -433,64 +499,92 @@ class ImageEditor:
                 tags=f"polygon_{idx}"
             )
             
-            # Desenha os pontos de controle
-            for p_idx, (x, y) in enumerate(points):
-                fill_color = "red" if p_idx == 0 and self.current_polygon and len(self.current_polygon) > 2 else color
-                point = self.canvas.create_oval(
-                    x-5, y-5, x+5, y+5,
-                    fill=fill_color,
-                    outline="white",
-                    tags=f"poly_{idx}_point_{p_idx}"
-                )
-                # Armazena dados do ponto para manipulação
-                self.canvas.itemconfig(point, tags=(f"poly_{idx}_point_{p_idx}", "control_point"))
+            # Apenas desenha pontos no modo edição
+            if not self.view_mode.get():
+                for p_idx, (x, y) in enumerate(points):
+                    fill_color = "red" if p_idx == 0 else color
+                    self.canvas.create_oval(
+                        x-4, y-4, x+4, y+4,
+                        fill=fill_color,
+                        outline="white",
+                        width=1,
+                        tags=f"poly_{idx}_point_{p_idx}"
+                    )
             
-            # Desenha o label no centro do polígono
+            # Labels mais visíveis com fundo e contorno
             if points:
                 center_x = sum(p[0] for p in points) / len(points)
                 center_y = sum(p[1] for p in points) / len(points)
+                
+                # Label com fundo para melhor contraste
+                text = f"{label} ({poly_id})"
+                
+                # Calcula o tamanho aproximado do texto
+                text_width = len(text) * 7
+                text_height = 16
+                
+                # Desenha fundo do label
+                self.canvas.create_rectangle(
+                    center_x - text_width/2 - 4, center_y - text_height/2 - 2,
+                    center_x + text_width/2 + 4, center_y + text_height/2 + 2,
+                    fill="black",
+                    outline="white",
+                    width=1,
+                    tags="polygon_label_bg"
+                )
+                
+                # Desenha o texto do label
                 self.canvas.create_text(
                     center_x, center_y, 
-                    text=f"{label} ({poly_id})", 
+                    text=text, 
                     fill="white",
                     font=("Arial", 10, "bold"),
                     tags="polygon_label"
                 )
         
-        # Desenha polígono atual em construção
-        if self.current_polygon:
-            # Desenha linhas entre pontos
-            if len(self.current_polygon) > 1:
-                for i in range(1, len(self.current_polygon)):
-                    self.canvas.create_line(
-                        self.current_polygon[i-1][0], self.current_polygon[i-1][1],
-                        self.current_polygon[i][0], self.current_polygon[i][1],
-                        fill="#FF0000",
-                        width=2,
-                        tags="current_polygon"
-                    )
-            
-            # Desenha pontos de controle
-            for p_idx, (x, y) in enumerate(self.current_polygon):
-                fill_color = "red" if p_idx == 0 and len(self.current_polygon) > 2 else "#FF0000"
-                self.canvas.create_oval(
-                    x-5, y-5, x+5, y+5,
-                    fill=fill_color,
-                    outline="white",
-                    tags=f"current_point_{p_idx}"
+        # Polígono atual em construção (sempre mostra pontos)
+        if self.current_polygon and not self.view_mode.get():
+            self.draw_current_polygon()
+
+    def draw_current_polygon(self):
+        """Desenha polígono atual em construção"""
+        points = self.current_polygon
+        if self.scale_factor != 1.0:
+            points = [(x * self.scale_factor, y * self.scale_factor) for x, y in points]
+        
+        # Linhas retas
+        if len(points) > 1:
+            for i in range(1, len(points)):
+                self.canvas.create_line(
+                    points[i-1][0], points[i-1][1],
+                    points[i][0], points[i][1],
+                    fill="#FF0000",
+                    width=2,
+                    tags="current_polygon"
                 )
-                
-                # Conectar ao primeiro ponto se estiver próximo
-                if p_idx == 0 and len(self.current_polygon) > 2:
-                    # Desenha linha de conexão ao primeiro ponto
-                    self.canvas.create_line(
-                        self.current_polygon[-1][0], self.current_polygon[-1][1],
-                        x, y,
-                        fill="#FF0000",
-                        width=2,
-                        dash=(4, 2),
-                        tags="closing_line"
-                    )
+        
+        # Pontos do polígono atual
+        for p_idx, (x, y) in enumerate(points):
+            fill_color = "red" if p_idx == 0 and len(points) > 2 else "#FF0000"
+            self.canvas.create_oval(
+                x-4, y-4, x+4, y+4,
+                fill=fill_color,
+                outline="white",
+                width=1,
+                tags=f"current_point_{p_idx}"
+            )
+            
+            # Conectar ao primeiro ponto se estiver próximo
+            if p_idx == 0 and len(points) > 2:
+                # Desenha linha de conexão ao primeiro ponto
+                self.canvas.create_line(
+                    points[-1][0], points[-1][1],
+                    x, y,
+                    fill="#FF0000",
+                    width=2,
+                    dash=(4, 2),
+                    tags="closing_line"
+                )
 
     def draw_crop_rectangle(self):
         """Desenha o retângulo de recorte se existir"""
@@ -519,6 +613,26 @@ class ImageEditor:
                     tags="resize_handle"
                 )
 
+    def find_point_at_position(self, x, y, tolerance=6):
+        """
+        Encontra um ponto de polígono próximo à posição (x, y).
+        Retorna (polygon_index, point_index) ou (None, None) se não encontrar.
+        """
+        # Primeiro, verifica os pontos do polígono atual em construção
+        for p_idx, (px, py) in enumerate(self.current_polygon):
+            distance = ((px - x) ** 2 + (py - y) ** 2) ** 0.5
+            if distance <= tolerance:
+                return (None, p_idx)  # Polígono atual, ponto p_idx
+        
+        # Depois, verifica os pontos dos polígonos finalizados
+        for poly_idx, polygon_data in enumerate(self.polygons):
+            for p_idx, (px, py) in enumerate(polygon_data['points']):
+                distance = ((px - x) ** 2 + (py - y) ** 2) ** 0.5
+                if distance <= tolerance:
+                    return (poly_idx, p_idx)  # Polígono poly_idx, ponto p_idx
+                    
+        return (None, None)
+
     def on_left_click(self, event):
         """Manipula cliques do botão esquerdo do mouse"""
         if self.zoom_state and self.mode != 'polygon':
@@ -526,15 +640,29 @@ class ImageEditor:
             return
             
         if self.mode == 'polygon':
-            # Verificar se clicou em um ponto existente para finalizar
+            # Se estiver no modo de edição, prioriza a movimentação de pontos
+            if self.edit_mode:
+                self.dragging_polygon, self.dragging_point = self.find_point_at_position(event.x, event.y)
+                if self.dragging_polygon is not None or self.dragging_point is not None:
+                    # Salva o estado para desfazer e calcula o offset do arraste
+                    self.save_state_to_history()
+                    if self.dragging_polygon is not None:
+                        # Está arrastando um ponto de um polígono finalizado
+                        poly_points = self.polygons[self.dragging_polygon]['points']
+                    else:
+                        # Está arrastando um ponto do polígono atual
+                        poly_points = self.current_polygon
+                    point_x, point_y = poly_points[self.dragging_point]
+                    self.drag_offset = (event.x - point_x, event.y - point_y)
+                    self.redraw()
+                    self.update_status(f"Arrastando ponto {self.dragging_point}")
+                    return
+            
+            # Verificar se clicou no primeiro ponto para finalizar
             if self.check_close_to_first_point(event):
                 self.finalize_polygon()
                 return
-                
-            # Verificar se clicou em um ponto para mover
-            if self.handle_point_drag_start(event):
-                return
-                
+                    
             # Selecionar polígono existente
             if self.select_polygon(event):
                 return
@@ -576,36 +704,6 @@ class ImageEditor:
                 return True
         return False
 
-    def handle_point_drag_start(self, event):
-        """Inicia o arraste de um ponto existente"""
-        # Verificar se clicou em um ponto de controle de polígono existente
-        items = self.canvas.find_overlapping(event.x-5, event.y-5, event.x+5, event.y+5)
-        for item in items:
-            tags = self.canvas.gettags(item)
-            if "control_point" in tags:
-                # Encontrar qual ponto de qual polígono
-                for tag in tags:
-                    if tag.startswith("poly_"):
-                        parts = tag.split("_")
-                        poly_idx = int(parts[1])
-                        point_idx = int(parts[3])
-                        
-                        # Se for um polígono já finalizado
-                        if parts[0] == "poly" and poly_idx < len(self.polygons):
-                            self.dragging_polygon = poly_idx
-                            self.dragging_point = point_idx
-                            self.drag_offset = (event.x - self.polygons[poly_idx]['points'][point_idx][0], 
-                                              event.y - self.polygons[poly_idx]['points'][point_idx][1])
-                            return True
-                        # Se for o polígono atual em construção
-                        elif tag.startswith("current_point"):
-                            point_idx = int(tag.split("_")[-1])
-                            self.dragging_point = point_idx
-                            self.drag_offset = (event.x - self.current_polygon[point_idx][0], 
-                                              event.y - self.current_polygon[point_idx][1])
-                            return True
-        return False
-
     def handle_polygon_click(self, event):
         """Adiciona ponto ao polígono atual"""
         self.current_polygon.append((event.x, event.y))
@@ -642,21 +740,18 @@ class ImageEditor:
         if self.zoom_state and self.mode != 'polygon':
             return
             
-        # Arrastar ponto de polígono
+        # Arrastar ponto de polígono - CORREÇÃO PRINCIPAL
         if self.dragging_point is not None:
+            new_x = event.x - self.drag_offset[0]
+            new_y = event.y - self.drag_offset[1]
+            
             if self.dragging_polygon is not None:
-                # Arrastando ponto de polígono existente
-                poly = self.polygons[self.dragging_polygon]
-                new_x = event.x - self.drag_offset[0]
-                new_y = event.y - self.drag_offset[1]
-                poly['points'][self.dragging_point] = (new_x, new_y)
-                self.redraw()
-            elif self.dragging_point is not None and self.current_polygon:
-                # Arrastando ponto do polígono atual
-                new_x = event.x - self.drag_offset[0]
-                new_y = event.y - self.drag_offset[1]
+                # Atualiza ponto em polígono finalizado
+                self.polygons[self.dragging_polygon]['points'][self.dragging_point] = (new_x, new_y)
+            elif self.dragging_point is not None:
+                # Atualiza ponto no polígono atual
                 self.current_polygon[self.dragging_point] = (new_x, new_y)
-                self.redraw()
+            self.redraw()
             return
             
         if self.mode == 'crop' and self.crop_start_point:
@@ -747,6 +842,7 @@ class ImageEditor:
             self.update_status("Ponto movido")
             
         self.temp_line = None
+        self.rect_moving = False
         self.redraw()
 
     def finalize_crop_rectangle(self):
@@ -1080,7 +1176,7 @@ class ImageEditor:
             json.dump(metadata, f, indent=4)
 
     def save_polygons(self):
-        """Salva polígonos em arquivo JSON com labels e IDs"""
+        """Salva polígonos em arquivo JSON com labels, IDs, coordenadas absolutas e normalizadas"""
         if not self.polygons:
             messagebox.showwarning("Aviso", "Nenhum polígono para salvar")
             return
@@ -1102,7 +1198,10 @@ class ImageEditor:
         for polygon_data in self.polygons:
             normalized = []
             for x, y in polygon_data['points']:
-                normalized.append((x / self.width, y / self.height))
+                # Calcula coordenadas relativas (0-1) 
+                x_rel = x / self.width
+                y_rel = y / self.height
+                normalized.append((x_rel, y_rel))
                 
             normalized_polygons.append({
                 'points': normalized,
@@ -1113,17 +1212,97 @@ class ImageEditor:
         
         # Estrutura de metadados completa
         metadata = {
-            "image_path": self.filepath,
-            "image_size": {"width": self.width, "height": self.height},
-            "polygons_absolute": self.polygons,
-            "polygons_normalized": normalized_polygons
+            "frame_size": {
+                "width": self.width,
+                "height": self.height
+            },
+            "polygons": [
+                {
+                    "label": poly['label'],
+                    "id": poly['id'],
+                    "points": poly['points']
+                } for poly in self.polygons
+            ],
+            "polygons_normalized": [
+                {
+                    "label": poly['label'],
+                    "id": poly['id'],
+                    "points": normalized_polygons[i]['points']
+                } for i, poly in enumerate(self.polygons)
+            ]
         }
         
-        with open(save_path, 'w') as f:
-            json.dump(metadata, f, indent=4)
+        with open(save_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=4, ensure_ascii=False)
         
         messagebox.showinfo("Sucesso", f"Polígonos salvos: {save_path}")
         self.reset_annotations()
+
+    def export_clean_image(self, event=None):
+        """Exporta imagem com polígonos mas sem elementos de interface"""
+        if not self.polygons and not self.current_polygon:
+            messagebox.showwarning("Aviso", "Nenhum polígono para exportar")
+            return
+        
+        save_path = filedialog.asksaveasfilename(
+            initialdir=self.last_save_dir,
+            defaultextension=".png",
+            filetypes=[
+                ("PNG files", "*.png"),
+                ("JPEG files", "*.jpg;*.jpeg"),
+                ("Todos os arquivos", "*.*")
+            ]
+        )
+        
+        if not save_path:
+            return
+        
+        # Cria imagem de fundo
+        if self.scale_factor != 1.0:
+            # Usa imagem em escala original
+            base_image = self.display_image.resize(
+                (self.width, self.height), Image.LANCZOS
+            )
+        else:
+            base_image = self.display_image.copy()
+        
+        # Desenha polígonos na imagem
+        draw = ImageDraw.Draw(base_image)
+        
+        for polygon_data in self.polygons:
+            points = polygon_data['points']
+            label = polygon_data['label']
+            color = polygon_data['color']
+            
+            # Converte cor hexadecimal para RGB
+            rgb_color = tuple(int(color[i:i+2], 16) for i in (1, 3, 5))
+            
+            # Desenha polígono
+            draw.polygon(points, outline=rgb_color, width=3)
+            
+            # Desenha label
+            if points:
+                center_x = sum(p[0] for p in points) / len(points)
+                center_y = sum(p[1] for p in points) / len(points)
+                
+                # Usa fonte maior para exportação
+                try:
+                    font = ImageFont.truetype("arial.ttf", 16)
+                except:
+                    font = ImageFont.load_default()
+                
+                # Texto com fundo para melhor legibilidade
+                text = f"{label} ({polygon_data['id']})"
+                bbox = draw.textbbox((center_x, center_y), text, font=font)
+                padding = 2
+                draw.rectangle(
+                    [bbox[0]-padding, bbox[1]-padding, bbox[2]+padding, bbox[3]+padding],
+                    fill=(0, 0, 0, 128)
+                )
+                draw.text((center_x, center_y), text, font=font, fill=(255, 255, 255))
+        
+        base_image.save(save_path)
+        self.update_status(f"Imagem exportada: {save_path}")
 
     def save_and_restart(self, event=None):
         """Salva o trabalho atual e reinicia o editor"""
