@@ -2,8 +2,8 @@
 Map Editor – Ferramenta para demarcar linhas de referência, polígonos e recortes.
 Salva automaticamente em ./maps/<nome_da_pasta>/lines.json + lines.png
 Com indicadores de direção (IN/OUT) para uso com YOLO.
-Lida corretamente com imagens pequenas: ajusta a visualização e restringe
-marcações apenas à área da imagem, mantendo as coordenadas normalizadas.
+Lida com imagens pequenas, preview de linha, edição fluida e PNG com setas, cores e
+textos sem sobreposição.
 """
 
 import cv2
@@ -18,6 +18,51 @@ import numpy as np
 from typing import List, Tuple, Optional, Dict, Any, Deque
 from collections import deque
 import colorsys
+import math
+
+
+class CollisionAvoidance:
+    """Gerenciador simples para evitar sobreposição de textos no PNG."""
+    def __init__(self):
+        self.occupied = []  # lista de (x1, y1, x2, y2)
+
+    def is_free(self, bbox):
+        """Retorna True se a área não colide com nenhuma já ocupada."""
+        ax1, ay1, ax2, ay2 = bbox
+        for (bx1, by1, bx2, by2) in self.occupied:
+            if not (ax2 < bx1 or ax1 > bx2 or ay2 < by1 or ay1 > by2):
+                return False
+        return True
+
+    def add(self, bbox):
+        self.occupied.append(bbox)
+
+    def find_free_y(self, x_center, desired_y, width, height, step=20, max_shift=200):
+        """Tenta posicionar um texto centralizado em x_center, desired_y ajustando y para baixo e para cima."""
+        bbox = (x_center - width//2, desired_y - height//2,
+                x_center + width//2, desired_y + height//2)
+        if self.is_free(bbox):
+            self.add(bbox)
+            return desired_y
+        # tentar para baixo
+        for shift in range(step, max_shift+1, step):
+            y_test = desired_y + shift
+            bbox = (x_center - width//2, y_test - height//2,
+                    x_center + width//2, y_test + height//2)
+            if self.is_free(bbox):
+                self.add(bbox)
+                return y_test
+        # tentar para cima
+        for shift in range(step, max_shift+1, step):
+            y_test = desired_y - shift
+            bbox = (x_center - width//2, y_test - height//2,
+                    x_center + width//2, y_test + height//2)
+            if self.is_free(bbox):
+                self.add(bbox)
+                return y_test
+        # se não achou, usa a posição original mesmo sobrepondo
+        self.add(bbox)
+        return desired_y
 
 
 class ImageEditor:
@@ -26,14 +71,13 @@ class ImageEditor:
         self.root.title("Map Editor")
         self.style = ttk.Style()
 
-        # Tenta usar o tema 'arc' (moderno). Se não existir, usa 'clam'.
         try:
             self.style.theme_use('arc')
         except:
             self.style.theme_use('clam')
 
         # -------------------------------------------------------
-        # CORREÇÃO VISUAL: garante texto legível nos diálogos de arquivo
+        # MELHORIAS DE VISIBILIDADE GLOBAL
         # -------------------------------------------------------
         self.root.option_add('*Listbox.selectForeground', 'black')
         self.root.option_add('*Listbox.selectBackground', '#c0c0ff')
@@ -41,8 +85,16 @@ class ImageEditor:
         self.root.option_add('*Entry.background', 'white')
         self.root.option_add('*TCombobox*Listbox.selectForeground', 'black')
         self.root.option_add('*TCombobox*Listbox.selectBackground', '#c0c0ff')
+        self.style.configure('.', foreground='black', background='#f0f0f0')
+        self.style.configure('TLabel', foreground='black', background='#f0f0f0')
+        self.style.configure('TButton', foreground='black', background='#e0e0e0')
+        self.style.map('TButton', background=[('active', '#c0c0c0')])
+        self.style.configure('TFrame', background='#f0f0f0')
+        self.style.configure('TCheckbutton', foreground='black', background='#f0f0f0')
+        self.style.configure('Visible.TEntry', foreground='black', background='white', fieldbackground='white')
+        self.root.configure(bg='#f0f0f0')
 
-        # Canvas com barras de rolagem
+        # Canvas com scrollbars
         self.frame = ttk.Frame(root)
         self.frame.pack(fill=tk.BOTH, expand=True)
         self.canvas = tk.Canvas(self.frame, width=1200, height=800, bg="#e0e0e0")
@@ -53,60 +105,55 @@ class ImageEditor:
         self.v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Overlay para zoom (não usado atualmente, mas mantido)
+        # Overlay de zoom (mantido)
         self.overlay = tk.Canvas(root, width=200, height=200, bg="white", bd=2, relief="solid")
         self.overlay.place(relx=1.0, rely=0.0, anchor="ne", x=-10, y=10)
         self.overlay.place_forget()
-        self.overlay_visible = False
 
         # -------------------------------------------------------
         # Variáveis de estado
         # -------------------------------------------------------
-        self.mode = None                     # 'polygon', 'crop' ou 'ref_line'
+        self.mode = None
         self.original_image: Optional[np.ndarray] = None
         self.display_image: Optional[Image.Image] = None
         self.filepath: Optional[str] = None
         self.polygons: List[Dict] = []
         self.lines: List[Dict] = []
-        self.current_polygon: List[Tuple[float, float]] = []  # armazenado em coordenadas originais
+        self.current_polygon: List[Tuple[float, float]] = []
         self.current_line_start: Optional[Tuple[float, float]] = None
-        self.crop_rect: Optional[Tuple[int, int, int, int]] = None  # em coordenadas do canvas? Melhor manter original
-        self.crop_start_point: Optional[Tuple[int, int]] = None
+        self.preview_line: Optional[Dict] = None
+        self.crop_rect: Optional[Tuple[float, float, float, float]] = None
+        self.crop_start_point: Optional[Tuple[float, float]] = None
         self.rect_moving = False
         self.keep_aspect_ratio = tk.BooleanVar(value=True)
         self.initial_load = True
         self.rect_move_offset = (0, 0)
-        self.scale_factor = 1.0             # fator de escala atual
+        self.scale_factor = 1.0
         self.zoom_state = False
         self.pan_start = None
         self.aspect_ratio = 1.0
         self.temp_line_id = None
         self.action_history: Deque = deque(maxlen=50)
 
-        # Arraste de pontos
         self.dragging_polygon = None
         self.dragging_point = None
         self.dragging_line_index = None
         self.dragging_line_point_index = None
         self.drag_offset = (0, 0)
 
-        # IDs automáticos
         self.next_polygon_id = 1
         self.next_line_id = 1
         self.next_color_index = 0
 
-        # Seleção
         self.selected_polygon_index = None
         self.selected_line_index = None
 
-        # Flags de modo
         self.view_mode = tk.BooleanVar(value=False)
         self.edit_mode = False
 
         # Cache de itens do canvas para performance
         self.canvas_items = {'polygons': {}, 'lines': {}, 'current_polygon': []}
 
-        # Pastas padrão
         self.frames_dir = "./frames"
         self.maps_dir = "./maps"
         os.makedirs(self.frames_dir, exist_ok=True)
@@ -121,7 +168,6 @@ class ImageEditor:
     # Geração de cores
     # ============================================================
     def generate_distinct_color(self):
-        """Gera cores diferentes usando proporção áurea."""
         hue = self.next_color_index * 0.618033988749895
         hue %= 1.0
         r, g, b = colorsys.hls_to_rgb(hue, 0.5, 0.9)
@@ -287,25 +333,20 @@ class ImageEditor:
         self.original_image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         self.height, self.width, _ = self.original_image.shape
         self.display_image = Image.fromarray(self.original_image)
-
-        # Ajusta escala inicial para preencher o canvas
         self.fit_image_to_canvas()
-
         self.canvas.xview_moveto(0)
         self.canvas.yview_moveto(0)
         self.show_mode_selection()
         self.update_status(f"Carregado: {os.path.basename(filepath)}")
 
     def fit_image_to_canvas(self):
-        """Ajusta self.scale_factor para que a imagem caiba no canvas mantendo a proporção."""
         canvas_width = self.canvas.winfo_width()
         canvas_height = self.canvas.winfo_height()
-        if canvas_width <= 1 or canvas_height <= 1:  # ainda não desenhado
+        if canvas_width <= 1 or canvas_height <= 1:
             canvas_width, canvas_height = 1200, 800
         scale_w = canvas_width / self.width
         scale_h = canvas_height / self.height
         self.scale_factor = min(scale_w, scale_h)
-        # Garante que não fique minúsculo (mínimo 0.1) nem gigante (máximo 10)
         self.scale_factor = max(0.1, min(self.scale_factor, 10.0))
 
     def show_mode_selection(self):
@@ -352,6 +393,7 @@ class ImageEditor:
         self.lines = []
         self.current_polygon = []
         self.current_line_start = None
+        self.preview_line = None
         self.crop_rect = None
         self.temp_line_id = None
         self.dragging_point = None
@@ -371,6 +413,7 @@ class ImageEditor:
             'lines': [l.copy() for l in self.lines],
             'current_polygon': self.current_polygon.copy(),
             'current_line_start': self.current_line_start,
+            'preview_line': self.preview_line,
             'crop_rect': self.crop_rect,
             'mode': self.mode,
             'next_polygon_id': self.next_polygon_id,
@@ -390,6 +433,7 @@ class ImageEditor:
         self.lines = prev['lines']
         self.current_polygon = prev['current_polygon']
         self.current_line_start = prev['current_line_start']
+        self.preview_line = prev.get('preview_line')
         self.crop_rect = prev['crop_rect']
         self.next_polygon_id = prev['next_polygon_id']
         self.next_line_id = prev['next_line_id']
@@ -406,13 +450,14 @@ class ImageEditor:
             self.redraw()
         elif self.mode == 'ref_line' and self.current_line_start:
             self.current_line_start = None
+            self.preview_line = None
             self.redraw()
         elif self.mode == 'crop' and self.crop_rect:
             self.crop_rect = None
             self.redraw()
 
     # ============================================================
-    # Desenho (coordenadas originais multiplicadas por scale_factor)
+    # Desenho no canvas (com armazenamento de IDs para edição rápida)
     # ============================================================
     def redraw(self):
         self.canvas.delete("all")
@@ -425,7 +470,6 @@ class ImageEditor:
     def display_image_on_canvas(self):
         if self.display_image is None:
             return
-        # Redimensiona de acordo com scale_factor
         w = int(self.width * self.scale_factor)
         h = int(self.height * self.scale_factor)
         img = self.display_image.resize((w, h), Image.LANCZOS)
@@ -434,36 +478,35 @@ class ImageEditor:
         self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image, tags="bg_image")
 
     def scale_point(self, x, y):
-        """Converte coordenadas da imagem original para coordenadas do canvas."""
         return x * self.scale_factor, y * self.scale_factor
 
     def unscale_point(self, cx, cy):
-        """Converte coordenadas do canvas para coordenadas da imagem original."""
         return cx / self.scale_factor, cy / self.scale_factor
 
     def draw_polygons(self):
         self.canvas_items['polygons'].clear()
         for idx, poly_data in enumerate(self.polygons):
-            # Pontos em coordenadas originais
-            points = [self.scale_point(x, y) for x, y in poly_data['points']]
-            outline_color = "#FFFF00" if (idx == self.selected_polygon_index and not self.view_mode.get()) else poly_data['color']
-            width = 4 if idx == self.selected_polygon_index else 3
-            pid = self.canvas.create_polygon(points, outline=outline_color, fill='', width=width)
-            self.canvas_items['polygons'][idx] = {'outline': pid, 'points': []}
+            pts = [self.scale_point(x, y) for x, y in poly_data['points']]
+            outline = "#FFFF00" if (idx == self.selected_polygon_index and not self.view_mode.get()) else poly_data['color']
+            w = 4 if idx == self.selected_polygon_index else 3
+            pid = self.canvas.create_polygon(pts, outline=outline, fill='', width=w)
+            items = {'outline': pid, 'points': []}
             if not self.view_mode.get():
-                for i, (sx, sy) in enumerate(points):
+                for i, (sx, sy) in enumerate(pts):
                     fill = "red" if i == 0 else poly_data['color']
                     oid = self.canvas.create_oval(sx-4, sy-4, sx+4, sy+4, fill=fill, outline="white", width=1)
-                    self.canvas_items['polygons'][idx]['points'].append(oid)
-            if points:
-                cx = sum(p[0] for p in points) / len(points)
-                cy = sum(p[1] for p in points) / len(points)
-                text = f"{poly_data['label']} ({poly_data['id']})"
-                tw = len(text) * 7
-                self.canvas.create_rectangle(cx - tw/2 - 4, cy - 12, cx + tw/2 + 4, cy + 4, fill="black", outline="white")
-                self.canvas.create_text(cx, cy - 4, text=text, fill="white", font=("Arial", 10, "bold"))
+                    items['points'].append(oid)
+            if pts:
+                cx = sum(p[0] for p in pts) / len(pts)
+                cy = sum(p[1] for p in pts) / len(pts)
+                txt = f"{poly_data['label']} ({poly_data['id']})"
+                tw = len(txt) * 7
+                bg = self.canvas.create_rectangle(cx-tw/2-4, cy-12, cx+tw/2+4, cy+4, fill="black", outline="white")
+                text = self.canvas.create_text(cx, cy-4, text=txt, fill="white", font=("Arial", 10, "bold"))
+                items['label_bg'] = bg
+                items['label_text'] = text
+            self.canvas_items['polygons'][idx] = items
 
-        # Polígono atual
         self.canvas_items['current_polygon'].clear()
         if self.current_polygon and not self.view_mode.get():
             pts = [self.scale_point(x, y) for x, y in self.current_polygon]
@@ -477,79 +520,109 @@ class ImageEditor:
     def draw_lines(self):
         self.canvas_items['lines'].clear()
         for idx, line_data in enumerate(self.lines):
-            pt1 = self.scale_point(*line_data['points'][0])
-            pt2 = self.scale_point(*line_data['points'][1])
+            self._draw_one_line(idx, line_data, is_preview=False)
+        if self.preview_line:
+            self._draw_one_line(-1, self.preview_line, is_preview=True)
+
+    def _draw_one_line(self, idx, line_data, is_preview=False):
+        pt1 = self.scale_point(*line_data['points'][0])
+        pt2 = self.scale_point(*line_data['points'][1])
+
+        if is_preview:
+            color = "#AAAAAA"
+            width = 3
+        else:
             color = "#FFFF00" if (idx == self.selected_line_index and not self.view_mode.get()) else line_data['color']
             width = 4 if idx == self.selected_line_index else 3
-            lid = self.canvas.create_line(pt1[0], pt1[1], pt2[0], pt2[1], fill=color, width=width)
-            self.canvas_items['lines'][idx] = {'line': lid, 'pt0': None, 'pt1': None}
+
+        lid = self.canvas.create_line(pt1[0], pt1[1], pt2[0], pt2[1], fill=color, width=width)
+
+        if not is_preview:
+            items = {'line': lid, 'pt0': None, 'pt1': None}
             if not self.view_mode.get():
                 o0 = self.canvas.create_oval(pt1[0]-4, pt1[1]-4, pt1[0]+4, pt1[1]+4, fill="green", outline="white")
                 o1 = self.canvas.create_oval(pt2[0]-4, pt2[1]-4, pt2[0]+4, pt2[1]+4, fill="blue", outline="white")
-                self.canvas_items['lines'][idx]['pt0'] = o0
-                self.canvas_items['lines'][idx]['pt1'] = o1
-
+                items['pt0'] = o0
+                items['pt1'] = o1
             if not self.view_mode.get():
-                self.draw_direction_indicators(pt1, pt2, color)
-
+                arrow_ids = self._create_direction_indicators(pt1, pt2, color)
+                items.update(arrow_ids)
             mx = (pt1[0] + pt2[0]) / 2
             my = (pt1[1] + pt2[1]) / 2
-            text = f"{line_data['label']} ({line_data['id']})"
-            tw = len(text) * 7
-            self.canvas.create_rectangle(mx - tw/2 - 4, my - 12, mx + tw/2 + 4, my + 4, fill="black", outline="white")
-            self.canvas.create_text(mx, my - 4, text=text, fill="white", font=("Arial", 10, "bold"))
+            txt = f"{line_data['label']} ({line_data['id']})"
+            tw = len(txt) * 7
+            bg = self.canvas.create_rectangle(mx-tw/2-4, my-12, mx+tw/2+4, my+4, fill="black", outline="white")
+            text = self.canvas.create_text(mx, my-4, text=txt, fill="white", font=("Arial", 10, "bold"))
+            items['label_bg'] = bg
+            items['label_text'] = text
+            self.canvas_items['lines'][idx] = items
+        else:
+            if not self.view_mode.get():
+                self.canvas.create_oval(pt1[0]-4, pt1[1]-4, pt1[0]+4, pt1[1]+4, fill="gray", outline="white")
+                self.canvas.create_oval(pt2[0]-4, pt2[1]-4, pt2[0]+4, pt2[1]+4, fill="gray", outline="white")
+            mx = (pt1[0] + pt2[0]) / 2
+            my = (pt1[1] + pt2[1]) / 2
+            self.canvas.create_rectangle(mx-30, my-12, mx+30, my+4, fill="black", outline="white")
+            self.canvas.create_text(mx, my-4, text="preview", fill="white", font=("Arial", 10, "bold"))
 
-    def draw_direction_indicators(self, pt1, pt2, color):
+    def _create_direction_indicators(self, pt1, pt2, color):
         dx = pt2[0] - pt1[0]
         dy = pt2[1] - pt1[1]
-        length = (dx**2 + dy**2) ** 0.5
+        length = (dx*dx + dy*dy) ** 0.5
         if length == 0:
-            return
+            return {}
         perp_x = -dy / length
-        perp_y = dx / length
-        mid_x = (pt1[0] + pt2[0]) / 2
-        mid_y = (pt1[1] + pt2[1]) / 2
-        arrow_len = 40 * self.scale_factor  # ajusta tamanho da seta conforme escala
-        in_x = mid_x + perp_x * arrow_len
-        in_y = mid_y + perp_y * arrow_len
-        self.canvas.create_line(mid_x, mid_y, in_x, in_y, arrow=tk.LAST, fill=color, width=2)
-        self.canvas.create_text(in_x + perp_x*8, in_y + perp_y*8, text="IN", fill=color, font=("Arial", 9, "bold"))
-        out_x = mid_x - perp_x * arrow_len
-        out_y = mid_y - perp_y * arrow_len
-        self.canvas.create_line(mid_x, mid_y, out_x, out_y, arrow=tk.LAST, fill=color, width=2)
-        self.canvas.create_text(out_x - perp_x*8, out_y - perp_y*8, text="OUT", fill=color, font=("Arial", 9, "bold"))
+        perp_y =  dx / length
+        mx = (pt1[0] + pt2[0]) / 2
+        my = (pt1[1] + pt2[1]) / 2
+        arrow_len = 40 * self.scale_factor
+        in_x = mx + perp_x * arrow_len
+        in_y = my + perp_y * arrow_len
+        in_arrow = self.canvas.create_line(mx, my, in_x, in_y, arrow=tk.LAST, fill=color, width=2)
+        in_text = self.canvas.create_text(in_x + perp_x*8, in_y + perp_y*8, text="IN", fill=color, font=("Arial", 9, "bold"))
+        out_x = mx - perp_x * arrow_len
+        out_y = my - perp_y * arrow_len
+        out_arrow = self.canvas.create_line(mx, my, out_x, out_y, arrow=tk.LAST, fill=color, width=2)
+        out_text = self.canvas.create_text(out_x - perp_x*8, out_y - perp_y*8, text="OUT", fill=color, font=("Arial", 9, "bold"))
+        return {
+            'in_arrow': in_arrow,
+            'in_text': in_text,
+            'out_arrow': out_arrow,
+            'out_text': out_text
+        }
 
     def draw_crop_rectangle(self):
         if self.mode == 'crop' and self.crop_rect:
-            # crop_rect armazenado em coordenadas originais? No código anterior era em canvas.
-            # Vamos padronizar: armazenar em coordenadas originais.
             x1, y1, x2, y2 = self.crop_rect
             sx1, sy1 = self.scale_point(x1, y1)
             sx2, sy2 = self.scale_point(x2, y2)
-            self.canvas.create_rectangle(sx1, sy1, sx2, sy2, outline="#00FF00", width=3, dash=(4,2))
+            self.canvas.create_rectangle(sx1, sy1, sx2, sy2, outline="#00FF00", width=3, dash=(4,2), tags="crop_rect")
+            handles = [
+                (sx1, sy1), (sx2, sy1), (sx2, sy2), (sx1, sy2),
+                ((sx1+sx2)//2, sy1), ((sx1+sx2)//2, sy2),
+                (sx1, (sy1+sy2)//2), (sx2, (sy1+sy2)//2)
+            ]
+            for hx, hy in handles:
+                self.canvas.create_rectangle(hx-5, hy-5, hx+5, hy+5, fill="#00FF00", outline="white", tags="resize_handle")
 
     def update_temp_line_visibility(self):
         if self.temp_line_id:
             self.canvas.delete(self.temp_line_id)
             self.temp_line_id = None
         if self.mode == 'polygon' and self.current_polygon and hasattr(self, 'temp_coords'):
-            last_pt = self.scale_point(*self.current_polygon[-1])
-            temp = self.temp_coords  # já está em canvas? Depende: vamos manter temp_coords em canvas
-            self.temp_line_id = self.canvas.create_line(last_pt[0], last_pt[1], temp[0], temp[1], fill="#FF0000", width=2, dash=(4,2))
+            last = self.scale_point(*self.current_polygon[-1])
+            self.temp_line_id = self.canvas.create_line(last[0], last[1], *self.temp_coords, fill="#FF0000", width=2, dash=(4,2))
         elif self.mode == 'ref_line' and self.current_line_start and hasattr(self, 'temp_coords'):
             start = self.scale_point(*self.current_line_start)
-            temp = self.temp_coords  # canvas
-            self.temp_line_id = self.canvas.create_line(start[0], start[1], temp[0], temp[1], fill="#00AAFF", width=2, dash=(4,2))
+            self.temp_line_id = self.canvas.create_line(start[0], start[1], *self.temp_coords, fill="#00AAFF", width=2, dash=(4,2))
 
     # ============================================================
-    # Eventos de mouse (com validação de limites)
+    # Eventos de mouse
     # ============================================================
     def is_inside_image(self, orig_x, orig_y):
-        """Verifica se as coordenadas originais estão dentro da imagem."""
         return 0 <= orig_x <= self.width and 0 <= orig_y <= self.height
 
     def on_left_click(self, event):
-        # Converte para coordenadas originais
         orig_x, orig_y = self.unscale_point(event.x, event.y)
         if not self.is_inside_image(orig_x, orig_y):
             self.update_status("Clique fora da imagem ignorado")
@@ -557,62 +630,69 @@ class ImageEditor:
         if self.mode == 'polygon':
             self.handle_polygon_click(orig_x, orig_y)
         elif self.mode == 'ref_line':
-            self.handle_line_click(orig_x, orig_y)
+            self.handle_line_click(orig_x, orig_y, event)
         elif self.mode == 'crop':
-            self.handle_crop_click(orig_x, orig_y)
+            self.handle_crop_click(orig_x, orig_y, event)
 
-    def handle_polygon_click(self, orig_x, orig_y):
+    def handle_polygon_click(self, ox, oy):
         if self.edit_mode:
-            poly_idx, pt_idx = self.find_polygon_point(orig_x, orig_y)
-            if poly_idx is not None:
+            idx, pt = self.find_polygon_point(ox, oy)
+            if idx is not None:
                 self.save_state_to_history()
-                self.dragging_polygon = poly_idx
-                self.dragging_point = pt_idx
-                point = self.polygons[poly_idx]['points'][pt_idx]
-                self.drag_offset = (orig_x - point[0], orig_y - point[1])
+                self.dragging_polygon = idx
+                self.dragging_point = pt
+                p = self.polygons[idx]['points'][pt]
+                self.drag_offset = (ox - p[0], oy - p[1])
                 return
-        if len(self.current_polygon) > 2 and self.close_to_first_point(orig_x, orig_y):
+        if len(self.current_polygon) > 2 and self.close_to_first_point(ox, oy):
             self.finalize_polygon()
             return
         self.save_state_to_history()
-        self.current_polygon.append((orig_x, orig_y))
+        self.current_polygon.append((ox, oy))
         self.redraw_current_polygon()
-        self.update_status(f"Ponto adicionado: ({orig_x:.1f}, {orig_y:.1f})")
+        self.update_status(f"Ponto adicionado: ({ox:.1f}, {oy:.1f})")
 
-    def handle_line_click(self, orig_x, orig_y):
+    def handle_line_click(self, ox, oy, event=None):
         if self.edit_mode:
-            line_idx, pt_idx = self.find_line_point(orig_x, orig_y)
-            if line_idx is not None:
+            li, pi = self.find_line_point(ox, oy)
+            if li is not None:
                 self.save_state_to_history()
-                self.dragging_line_index = line_idx
-                self.dragging_line_point_index = pt_idx
-                point = self.lines[line_idx]['points'][pt_idx]
-                self.drag_offset = (orig_x - point[0], orig_y - point[1])
-                self.selected_line_index = line_idx
+                self.dragging_line_index = li
+                self.dragging_line_point_index = pi
+                p = self.lines[li]['points'][pi]
+                self.drag_offset = (ox - p[0], oy - p[1])
+                self.selected_line_index = li
                 self.redraw()
                 return
-        line_idx = self.find_line_at_position(orig_x, orig_y)
-        if line_idx is not None:
-            self.selected_line_index = line_idx
+        li = self.find_line_at_position(ox, oy)
+        if li is not None:
+            self.selected_line_index = li
             self.redraw()
             return
         if self.current_line_start is None:
             self.save_state_to_history()
-            self.current_line_start = (orig_x, orig_y)
+            self.current_line_start = (ox, oy)
             self.redraw()
             self.update_status("Clique no segundo ponto")
         else:
-            # Verifica distância mínima
-            if ((orig_x - self.current_line_start[0])**2 + (orig_y - self.current_line_start[1])**2) < 4:
-                return
-            info = self.ask_shape_info("Linha")
-            if not info["label"]:
-                self.current_line_start = None
-                self.redraw()
+            if ((ox-self.current_line_start[0])**2 + (oy-self.current_line_start[1])**2) < 4:
                 return
             self.save_state_to_history()
+            self.preview_line = {
+                'points': [self.current_line_start, (ox, oy)],
+                'label': '', 'id': 0, 'color': '#AAAAAA'
+            }
+            self.redraw()
+            info = self.ask_shape_info("Linha")
+            if not info["label"]:
+                self.preview_line = None
+                self.current_line_start = None
+                self.redraw()
+                self.update_status("Criação cancelada")
+                return
+            self.preview_line = None
             self.lines.append({
-                'points': [self.current_line_start, (orig_x, orig_y)],
+                'points': [self.current_line_start, (ox, oy)],
                 'label': info["label"],
                 'id': info["id"],
                 'color': self.generate_distinct_color()
@@ -622,49 +702,50 @@ class ImageEditor:
             self.redraw()
             self.update_status(f"Linha '{info['label']}' criada")
 
-    def handle_crop_click(self, orig_x, orig_y):
-        # crop_rect em coordenadas originais
+    def handle_crop_click(self, ox, oy, event):
         self.save_state_to_history()
-        # Verifica handles de redimensionamento (feito no canvas)
-        # Necessário adaptar: converter handles para originais? Melhor manter crop_rect em originais e manipular no canvas.
-        # Para simplificar, vamos manter crop_rect em coordenadas originais.
+        handles = self.canvas.find_withtag("resize_handle")
+        for handle in handles:
+            x1, y1, x2, y2 = self.canvas.coords(handle)
+            if x1 <= event.x <= x2 and y1 <= event.y <= y2:
+                self.selected_handle = handle
+                self.crop_start_point = (ox, oy)
+                self.original_crop_rect = self.crop_rect
+                return
         if not self.crop_rect:
-            self.crop_start_point = (orig_x, orig_y)
+            self.crop_start_point = (ox, oy)
         else:
             x1, y1, x2, y2 = self.crop_rect
-            if x1 <= orig_x <= x2 and y1 <= orig_y <= y2:
+            if x1 <= ox <= x2 and y1 <= oy <= y2:
                 self.rect_moving = True
-                self.rect_move_offset = (orig_x - x1, orig_y - y1)
+                self.rect_move_offset = (ox - x1, oy - y1)
 
     def on_mouse_drag(self, event):
-        orig_x, orig_y = self.unscale_point(event.x, event.y)
-        # Se estiver arrastando ponto, permite sair um pouco? Melhor manter dentro.
+        ox, oy = self.unscale_point(event.x, event.y)
         if self.dragging_point is not None:
-            # Mantém dentro dos limites
-            orig_x = max(0, min(self.width, orig_x))
-            orig_y = max(0, min(self.height, orig_y))
+            ox = max(0, min(self.width, ox))
+            oy = max(0, min(self.height, oy))
             if self.dragging_polygon is not None:
-                self.polygons[self.dragging_polygon]['points'][self.dragging_point] = (orig_x, orig_y)
+                self.polygons[self.dragging_polygon]['points'][self.dragging_point] = (ox, oy)
                 self.update_polygon_canvas(self.dragging_polygon)
             else:
-                self.current_polygon[self.dragging_point] = (orig_x, orig_y)
+                self.current_polygon[self.dragging_point] = (ox, oy)
                 self.redraw_current_polygon()
             return
         if self.dragging_line_index is not None:
-            orig_x = max(0, min(self.width, orig_x))
-            orig_y = max(0, min(self.height, orig_y))
-            self.lines[self.dragging_line_index]['points'][self.dragging_line_point_index] = (orig_x, orig_y)
+            ox = max(0, min(self.width, ox))
+            oy = max(0, min(self.height, oy))
+            self.lines[self.dragging_line_index]['points'][self.dragging_line_point_index] = (ox, oy)
             self.update_line_canvas(self.dragging_line_index)
             return
         if self.mode == 'crop' and self.crop_start_point:
-            # Lógica de recorte usando coordenadas originais
             if hasattr(self, 'selected_handle'):
                 self.resize_crop_rectangle(event)
             else:
-                self.update_crop_rectangle(orig_x, orig_y)
+                self.update_crop_rectangle(ox, oy)
             self.redraw()
         elif self.mode == 'polygon' and self.current_polygon:
-            self.temp_coords = (event.x, event.y)  # mantido em canvas para linha temporária
+            self.temp_coords = (event.x, event.y)
             self.update_temp_line_visibility()
         elif self.mode == 'ref_line' and self.current_line_start:
             self.temp_coords = (event.x, event.y)
@@ -685,15 +766,92 @@ class ImageEditor:
         self.update_temp_line_visibility()
 
     def on_mouse_move(self, event):
-        orig_x, orig_y = self.unscale_point(event.x, event.y)
-        self.update_status(f"Img: ({orig_x:.1f}, {orig_y:.1f})")
+        ox, oy = self.unscale_point(event.x, event.y)
+        self.update_status(f"Img: ({ox:.1f}, {oy:.1f})")
         if self.mode in ('polygon', 'ref_line'):
             if (self.mode == 'polygon' and self.current_polygon) or (self.mode == 'ref_line' and self.current_line_start):
                 self.temp_coords = (event.x, event.y)
                 self.update_temp_line_visibility()
 
     # ============================================================
-    # Atualização incremental
+    # Recorte
+    # ============================================================
+    def resize_crop_rectangle(self, event):
+        ox, oy = self.unscale_point(event.x, event.y)
+        x1, y1, x2, y2 = self.original_crop_rect
+        hx1, hy1, hx2, hy2 = self.canvas.coords(self.selected_handle)
+        hcx = (hx1 + hx2) / 2
+        hcy = (hy1 + hy2) / 2
+        hox, hoy = self.unscale_point(hcx, hcy)
+        eps = 5 / self.scale_factor
+        left = abs(hox - x1) < eps
+        right = abs(hox - x2) < eps
+        top = abs(hoy - y1) < eps
+        bottom = abs(hoy - y2) < eps
+        if left and top: x1, y1 = ox, oy
+        elif right and top: x2, y1 = ox, oy
+        elif right and bottom: x2, y2 = ox, oy
+        elif left and bottom: x1, y2 = ox, oy
+        elif top: y1 = oy
+        elif bottom: y2 = oy
+        elif left: x1 = ox
+        elif right: x2 = ox
+        else: return
+        self.crop_rect = (min(x1,x2), min(y1,y2), max(x1,x2), max(y1,y2))
+
+    def update_crop_rectangle(self, ox, oy):
+        if not self.crop_start_point:
+            return
+        x1, y1 = self.crop_start_point
+        x2, y2 = ox, oy
+        if self.keep_aspect_ratio.get():
+            dx = x2 - x1
+            dy = y2 - y1
+            if abs(dx) > abs(dy):
+                y2 = y1 + dx / self.aspect_ratio
+            else:
+                x2 = x1 + dy * self.aspect_ratio
+        self.crop_rect = (min(x1,x2), min(y1,y2), max(x1,x2), max(y1,y2))
+
+    def finalize_crop_rectangle(self):
+        x1, y1, x2, y2 = self.crop_rect
+        self.crop_rect = (
+            max(0, min(x1, x2)),
+            max(0, min(y1, y2)),
+            min(self.width, max(x1, x2)),
+            min(self.height, max(y1, y2))
+        )
+
+    def on_right_click(self, event):
+        if self.mode == 'crop' and self.crop_rect:
+            self.save_state_to_history()
+            ox, oy = self.unscale_point(event.x, event.y)
+            x1, y1, x2, y2 = self.crop_rect
+            if x1 <= ox <= x2 and y1 <= oy <= y2:
+                self.rect_moving = True
+                self.rect_move_offset = (ox - x1, oy - y1)
+
+    def on_right_drag(self, event):
+        if self.mode == 'crop' and self.rect_moving:
+            ox, oy = self.unscale_point(event.x, event.y)
+            self.move_crop_rectangle(ox, oy)
+
+    def move_crop_rectangle(self, ox, oy):
+        offset_x, offset_y = self.rect_move_offset
+        w = self.crop_rect[2] - self.crop_rect[0]
+        h = self.crop_rect[3] - self.crop_rect[1]
+        x1 = max(0, min(ox - offset_x, self.width - w))
+        y1 = max(0, min(oy - offset_y, self.height - h))
+        x2 = x1 + w
+        y2 = y1 + h
+        self.crop_rect = (x1, y1, x2, y2)
+        self.redraw()
+
+    def on_right_release(self, event):
+        self.rect_moving = False
+
+    # ============================================================
+    # Atualização incremental (sem redraw, para edição fluida)
     # ============================================================
     def update_polygon_canvas(self, idx):
         items = self.canvas_items['polygons'].get(idx)
@@ -704,7 +862,14 @@ class ImageEditor:
         for i, (sx, sy) in enumerate(pts):
             if i < len(items['points']):
                 self.canvas.coords(items['points'][i], sx-4, sy-4, sx+4, sy+4)
-        self.redraw()
+        if pts:
+            cx = sum(p[0] for p in pts) / len(pts)
+            cy = sum(p[1] for p in pts) / len(pts)
+            txt = f"{self.polygons[idx]['label']} ({self.polygons[idx]['id']})"
+            tw = len(txt) * 7
+            self.canvas.coords(items['label_bg'], cx-tw/2-4, cy-12, cx+tw/2+4, cy+4)
+            self.canvas.coords(items['label_text'], cx, cy-4)
+            self.canvas.itemconfig(items['label_text'], text=txt)
 
     def update_line_canvas(self, idx):
         items = self.canvas_items['lines'].get(idx)
@@ -717,7 +882,28 @@ class ImageEditor:
             self.canvas.coords(items['pt0'], pt1[0]-4, pt1[1]-4, pt1[0]+4, pt1[1]+4)
         if items['pt1']:
             self.canvas.coords(items['pt1'], pt2[0]-4, pt2[1]-4, pt2[0]+4, pt2[1]+4)
-        self.redraw()
+        mx = (pt1[0] + pt2[0]) / 2
+        my = (pt1[1] + pt2[1]) / 2
+        txt = f"{self.lines[idx]['label']} ({self.lines[idx]['id']})"
+        tw = len(txt) * 7
+        self.canvas.coords(items['label_bg'], mx-tw/2-4, my-12, mx+tw/2+4, my+4)
+        self.canvas.coords(items['label_text'], mx, my-4)
+        self.canvas.itemconfig(items['label_text'], text=txt)
+        dx = pt2[0] - pt1[0]
+        dy = pt2[1] - pt1[1]
+        length = (dx*dx + dy*dy) ** 0.5
+        if length > 0:
+            perp_x = -dy / length
+            perp_y =  dx / length
+            arrow_len = 40 * self.scale_factor
+            in_x = mx + perp_x * arrow_len
+            in_y = my + perp_y * arrow_len
+            out_x = mx - perp_x * arrow_len
+            out_y = my - perp_y * arrow_len
+            self.canvas.coords(items['in_arrow'], mx, my, in_x, in_y)
+            self.canvas.coords(items['in_text'], in_x + perp_x*8, in_y + perp_y*8)
+            self.canvas.coords(items['out_arrow'], mx, my, out_x, out_y)
+            self.canvas.coords(items['out_text'], out_x - perp_x*8, out_y - perp_y*8)
 
     def redraw_current_polygon(self):
         for oid in self.canvas_items['current_polygon']:
@@ -734,50 +920,49 @@ class ImageEditor:
             self.canvas_items['current_polygon'].append(oid)
 
     # ============================================================
-    # Funções de detecção (trabalham com coordenadas originais)
+    # Detecção
     # ============================================================
-    def find_polygon_point(self, orig_x, orig_y):
+    def find_polygon_point(self, ox, oy):
         for idx, poly in enumerate(self.polygons):
             for i, (px, py) in enumerate(poly['points']):
-                if ((px - orig_x)**2 + (py - orig_y)**2)**0.5 < 8 / self.scale_factor:
+                if ((px-ox)**2 + (py-oy)**2)**0.5 < 8 / self.scale_factor:
                     return idx, i
         for i, (px, py) in enumerate(self.current_polygon):
-            if ((px - orig_x)**2 + (py - orig_y)**2)**0.5 < 8 / self.scale_factor:
+            if ((px-ox)**2 + (py-oy)**2)**0.5 < 8 / self.scale_factor:
                 return None, i
         return None, None
 
-    def find_line_point(self, orig_x, orig_y):
+    def find_line_point(self, ox, oy):
         for idx, line in enumerate(self.lines):
             for i, (px, py) in enumerate(line['points']):
-                if ((px - orig_x)**2 + (py - orig_y)**2)**0.5 < 8 / self.scale_factor:
+                if ((px-ox)**2 + (py-oy)**2)**0.5 < 8 / self.scale_factor:
                     return idx, i
         return None, None
 
-    def find_line_at_position(self, orig_x, orig_y):
+    def find_line_at_position(self, ox, oy):
         for idx, line in enumerate(self.lines):
             pt1, pt2 = line['points']
-            dist = self.point_to_segment_dist(orig_x, orig_y, pt1[0], pt1[1], pt2[0], pt2[1])
+            dist = self.point_to_segment_dist(ox, oy, pt1[0], pt1[1], pt2[0], pt2[1])
             if dist < 5 / self.scale_factor:
                 return idx
         return None
 
     @staticmethod
     def point_to_segment_dist(px, py, x1, y1, x2, y2):
-        dx = x2 - x1
-        dy = y2 - y1
-        if dx == 0 and dy == 0:
-            return ((px-x1)**2 + (py-y1)**2) ** 0.5
+        dx, dy = x2-x1, y2-y1
+        if dx==0 and dy==0:
+            return ((px-x1)**2 + (py-y1)**2)**0.5
         t = ((px-x1)*dx + (py-y1)*dy) / (dx*dx + dy*dy)
         t = max(0, min(1, t))
-        projx = x1 + t*dx
-        projy = y1 + t*dy
-        return ((px-projx)**2 + (py-projy)**2) ** 0.5
+        proj_x = x1 + t*dx
+        proj_y = y1 + t*dy
+        return ((px-proj_x)**2 + (py-proj_y)**2)**0.5
 
-    def close_to_first_point(self, orig_x, orig_y):
+    def close_to_first_point(self, ox, oy):
         if not self.current_polygon:
             return False
         fx, fy = self.current_polygon[0]
-        return ((orig_x - fx)**2 + (orig_y - fy)**2)**0.5 < 10 / self.scale_factor
+        return ((ox-fx)**2 + (oy-fy)**2)**0.5 < 10 / self.scale_factor
 
     def finalize_polygon(self):
         if len(self.current_polygon) < 3:
@@ -813,6 +998,7 @@ class ImageEditor:
                 self.redraw()
             elif self.current_line_start:
                 self.current_line_start = None
+                self.preview_line = None
                 self.redraw()
 
     # ============================================================
@@ -824,16 +1010,18 @@ class ImageEditor:
         dialog.geometry("300x180")
         dialog.resizable(False, False)
         dialog.transient(self.root)
-        dialog.grab_set()
-        tk.Label(dialog, text="Nome / Label:").pack(pady=(10,0))
-        label_entry = ttk.Entry(dialog)
+        dialog.configure(bg='#f0f0f0')
+        tk.Label(dialog, text="Nome / Label:", bg='#f0f0f0', font=("Arial", 10)).pack(pady=(15,0))
+        label_entry = ttk.Entry(dialog, font=("Arial", 10))
         label_entry.pack(pady=5, padx=20, fill=tk.X)
+        label_entry.configure(style='Visible.TEntry')
         default_label = f"{shape_type} {self.next_polygon_id if shape_type=='Polígono' else self.next_line_id}"
         label_entry.insert(0, default_label)
         label_entry.focus_set()
-        tk.Label(dialog, text="ID:").pack()
-        id_entry = ttk.Entry(dialog)
+        tk.Label(dialog, text="ID:", bg='#f0f0f0', font=("Arial", 10)).pack(pady=(5,0))
+        id_entry = ttk.Entry(dialog, font=("Arial", 10))
         id_entry.pack(pady=5, padx=20, fill=tk.X)
+        id_entry.configure(style='Visible.TEntry')
         default_id = str(self.next_polygon_id if shape_type=='Polígono' else self.next_line_id)
         id_entry.insert(0, default_id)
         self.shape_info_result = {"label": "", "id": ""}
@@ -844,14 +1032,14 @@ class ImageEditor:
                 messagebox.showerror("Erro", "Label não pode ser vazio", parent=dialog)
                 return
             try:
-                poly_id = int(id_val)
-                if poly_id <= 0:
+                pid = int(id_val)
+                if pid <= 0:
                     messagebox.showerror("Erro", "ID deve ser positivo", parent=dialog)
                     return
             except ValueError:
                 messagebox.showerror("Erro", "ID deve ser um número inteiro", parent=dialog)
                 return
-            self.shape_info_result = {"label": label, "id": poly_id}
+            self.shape_info_result = {"label": label, "id": pid}
             dialog.destroy()
         def on_cancel():
             self.shape_info_result = {"label": "", "id": ""}
@@ -861,11 +1049,12 @@ class ImageEditor:
         ttk.Button(btn_frame, text="Cancelar", command=on_cancel).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="OK", command=on_ok).pack(side=tk.RIGHT)
         dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+        dialog.update()
         dialog.wait_window()
         return self.shape_info_result
 
     # ============================================================
-    # Salvamento
+    # Salvamento de linhas (com setas reais, cores e anti‑sobreposição)
     # ============================================================
     def save_lines(self):
         if not self.lines:
@@ -875,12 +1064,10 @@ class ImageEditor:
             messagebox.showerror("Erro", "Nenhuma imagem base carregada")
             return
         default_name = os.path.splitext(os.path.basename(self.filepath))[0]
-        folder_name = simpledialog.askstring(
-            "Nome da pasta",
-            "Digite o nome da subpasta dentro de ./maps:",
-            initialvalue=default_name,
-            parent=self.root
-        )
+        folder_name = simpledialog.askstring("Nome da pasta",
+                                             "Digite o nome da subpasta dentro de ./maps:",
+                                             initialvalue=default_name,
+                                             parent=self.root)
         if not folder_name:
             return
         folder_name = "".join(c for c in folder_name if c.isalnum() or c in (' ', '_', '-')).strip()
@@ -892,7 +1079,6 @@ class ImageEditor:
         img_path = os.path.join(out_dir, "lines.png")
         if os.path.exists(json_path) and not messagebox.askyesno("Sobrescrever", f"{json_path} já existe. Continuar?"):
             return
-        # Normalização
         norm_lines = []
         for l in self.lines:
             pt1, pt2 = l['points']
@@ -917,100 +1103,173 @@ class ImageEditor:
         messagebox.showinfo("Sucesso", f"Salvo em {out_dir}")
         self.reset_annotations()
 
+    def _get_bold_font(self, size):
+        font_paths = [
+            "arialbd.ttf",
+            "Arial Bold.ttf",
+            "/usr/share/fonts/truetype/msttcorefonts/Arial_Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "DejaVuSans-Bold.ttf",
+            "/System/Library/Fonts/Arial Bold.ttf",
+        ]
+        for path in font_paths:
+            if os.path.exists(path):
+                try:
+                    return ImageFont.truetype(path, size)
+                except:
+                    continue
+        return None
+
+    def _draw_text_with_outline(self, draw, xy, text, font, text_color, outline_color="black", outline_width=2):
+        x, y = xy
+        for adj_x in range(-outline_width, outline_width+1):
+            for adj_y in range(-outline_width, outline_width+1):
+                if adj_x != 0 or adj_y != 0:
+                    draw.text((x+adj_x, y+adj_y), text, font=font, fill=outline_color, anchor="mm")
+        draw.text((x, y), text, font=font, fill=text_color, anchor="mm")
+
+    def _draw_arrow(self, draw, start, end, fill, width=3, arrow_size=12):
+        """Desenha uma linha com ponta de seta triangular."""
+        draw.line([start, end], fill=fill, width=width)
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length = math.hypot(dx, dy)
+        if length == 0:
+            return
+        ux = dx / length
+        uy = dy / length
+        tip = end
+        base = (tip[0] - ux * arrow_size, tip[1] - uy * arrow_size)
+        px = -uy
+        py = ux
+        base_left = (base[0] + px * arrow_size * 0.5, base[1] + py * arrow_size * 0.5)
+        base_right = (base[0] - px * arrow_size * 0.5, base[1] - py * arrow_size * 0.5)
+        draw.polygon([tip, base_left, base_right], fill=fill)
+
     def export_lines_image(self, path):
+        """Exporta PNG com setas reais, cores por linha e sem sobreposição de textos.
+        Labels com 14pt, IN/OUT com 10pt."""
         if not self.display_image:
             return
-        img = self.display_image.copy()
-        draw = ImageDraw.Draw(img)
-        try:
-            font = ImageFont.truetype("arial.ttf", 16)
-        except:
-            font = ImageFont.load_default()
+        img = self.display_image.copy().convert("RGBA")
+        overlay = Image.new("RGBA", img.size, (255,255,255,0))
+        draw = ImageDraw.Draw(overlay)
+
+        label_size = 14
+        arrow_size = 10
+
+        label_font_bold = self._get_bold_font(label_size)
+        if label_font_bold is None:
+            try:
+                label_font_bold = ImageFont.truetype("arial.ttf", label_size)
+            except:
+                label_font_bold = ImageFont.load_default()
+
+        arrow_font_bold = self._get_bold_font(arrow_size)
+        if arrow_font_bold is None:
+            try:
+                arrow_font_bold = ImageFont.truetype("arial.ttf", arrow_size)
+            except:
+                arrow_font_bold = label_font_bold
+
+        collision = CollisionAvoidance()
+        texts_to_draw = []
+
         for l in self.lines:
-            pt1, pt2 = l['points']  # originais
+            pt1, pt2 = l['points']
             color = l['color']
             rgb = tuple(int(color[i:i+2], 16) for i in (1,3,5))
+
+            # Linha principal
             draw.line([pt1, pt2], fill=rgb, width=4)
-            r = 4
-            draw.ellipse([pt1[0]-r, pt1[1]-r, pt1[0]+r, pt1[1]+r], fill="green")
-            draw.ellipse([pt2[0]-r, pt2[1]-r, pt2[0]+r, pt2[1]+r], fill="blue")
+
+            # Pontos extremos
+            r = 6
+            draw.ellipse([pt1[0]-r, pt1[1]-r, pt1[0]+r, pt1[1]+r], fill="green", outline="black", width=2)
+            draw.ellipse([pt2[0]-r, pt2[1]-r, pt2[0]+r, pt2[1]+r], fill="blue", outline="black", width=2)
+
+            # Direção com setas
             dx, dy = pt2[0]-pt1[0], pt2[1]-pt1[1]
             length = (dx**2+dy**2)**0.5
-            if length:
+            if length > 0:
                 perp_x, perp_y = -dy/length, dx/length
                 mx, my = (pt1[0]+pt2[0])/2, (pt1[1]+pt2[1])/2
-                in_x, in_y = mx+perp_x*40, my+perp_y*40
-                out_x, out_y = mx-perp_x*40, my-perp_y*40
-                draw.line([mx, my, in_x, in_y], fill=rgb, width=2)
-                draw.line([mx, my, out_x, out_y], fill=rgb, width=2)
-                draw.text((in_x+perp_x*8, in_y+perp_y*8), "IN", fill=rgb, font=font)
-                draw.text((out_x-perp_x*8, out_y-perp_y*8), "OUT", fill=rgb, font=font)
+                arrow_len = 50
+                text_offset = 20
+
+                # IN
+                in_x = mx + perp_x * arrow_len
+                in_y = my + perp_y * arrow_len
+                self._draw_arrow(draw, (mx, my), (in_x, in_y), fill=rgb, width=3, arrow_size=12)
+                in_text_x = mx + perp_x * (arrow_len + text_offset)
+                in_text_y = my + perp_y * (arrow_len + text_offset)
+                texts_to_draw.append((in_text_x, in_text_y, "IN", arrow_font_bold, rgb, "direction"))
+
+                # OUT
+                out_x = mx - perp_x * arrow_len
+                out_y = my - perp_y * arrow_len
+                self._draw_arrow(draw, (mx, my), (out_x, out_y), fill=rgb, width=3, arrow_size=12)
+                out_text_x = mx - perp_x * (arrow_len + text_offset)
+                out_text_y = my - perp_y * (arrow_len + text_offset)
+                texts_to_draw.append((out_text_x, out_text_y, "OUT", arrow_font_bold, rgb, "direction"))
+
+            # Label da linha
+            mx, my = (pt1[0]+pt2[0])/2, (pt1[1]+pt2[1])/2
             text = f"{l['label']} ({l['id']})"
-            draw.text((mx, my-12), text, fill=rgb, font=font)
-        img.save(path)
+            texts_to_draw.append((mx, my, text, label_font_bold, rgb, "label"))
 
-    # Métodos de recorte e exportação mantidos (adaptados para coordenadas originais)
-    def resize_crop_rectangle(self, event):
-        # Implementar conforme necessidade, usando unscale_point
-        pass
+        # Desenha textos com anti‑colisão
+        for (cx, cy, text, font, color, typ) in texts_to_draw:
+            bbox_text = draw.textbbox((0, 0), text, font=font, anchor="mm")
+            text_width = bbox_text[2] - bbox_text[0]
+            text_height = bbox_text[3] - bbox_text[1]
+            margin = 6
+            box_width = text_width + 2 * margin
+            box_height = text_height + 8
 
-    def update_crop_rectangle(self, orig_x, orig_y):
-        if not self.crop_start_point:
+            final_y = collision.find_free_y(cx, cy, box_width, box_height)
+            draw.rectangle([cx - box_width//2, final_y - box_height//2,
+                            cx + box_width//2, final_y + box_height//2],
+                           fill=(0,0,0,255))
+            self._draw_text_with_outline(draw, (cx, final_y), text, font, color, "black", 2)
+
+        out = Image.alpha_composite(img, overlay)
+        out.save(path)
+
+    # ============================================================
+    # Demais métodos de salvamento/exportação (mantidos)
+    # ============================================================
+    def save_polygons(self):
+        if not self.polygons:
+            messagebox.showwarning("Aviso", "Nenhum polígono para salvar")
             return
-        x1, y1 = self.crop_start_point
-        x2, y2 = orig_x, orig_y
-        if self.keep_aspect_ratio.get():
-            dx = x2 - x1
-            dy = y2 - y1
-            if abs(dx) > abs(dy):
-                y2 = y1 + dx / self.aspect_ratio
-            else:
-                x2 = x1 + dy * self.aspect_ratio
-        self.crop_rect = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
-
-    def finalize_crop_rectangle(self):
-        x1, y1, x2, y2 = self.crop_rect
-        self.crop_rect = (
-            max(0, min(x1, x2)),
-            max(0, min(y1, y2)),
-            min(self.width, max(x1, x2)),
-            min(self.height, max(y1, y2))
+        save_path = filedialog.asksaveasfilename(
+            initialdir=self.last_save_dir, defaultextension=".json",
+            filetypes=[("JSON files", "*.json")]
         )
-
-    def on_right_click(self, event):
-        orig_x, orig_y = self.unscale_point(event.x, event.y)
-        if self.mode == 'crop' and self.crop_rect:
-            self.save_state_to_history()
-            x1, y1, x2, y2 = self.crop_rect
-            if x1 <= orig_x <= x2 and y1 <= orig_y <= y2:
-                self.rect_moving = True
-                self.rect_move_offset = (orig_x - x1, orig_y - y1)
-
-    def on_right_drag(self, event):
-        if self.mode == 'crop' and self.rect_moving:
-            orig_x, orig_y = self.unscale_point(event.x, event.y)
-            self.move_crop_rectangle(orig_x, orig_y)
-
-    def move_crop_rectangle(self, orig_x, orig_y):
-        offset_x, offset_y = self.rect_move_offset
-        rect_width = self.crop_rect[2] - self.crop_rect[0]
-        rect_height = self.crop_rect[3] - self.crop_rect[1]
-        x1 = max(0, min(orig_x - offset_x, self.width - rect_width))
-        y1 = max(0, min(orig_y - offset_y, self.height - rect_height))
-        x2 = x1 + rect_width
-        y2 = y1 + rect_height
-        self.crop_rect = (x1, y1, x2, y2)
-        self.redraw()
-
-    def on_right_release(self, event):
-        self.rect_moving = False
+        if not save_path:
+            return
+        self.last_save_dir = os.path.dirname(save_path)
+        normalized = []
+        for p in self.polygons:
+            norm_pts = [(x/self.width, y/self.height) for x, y in p['points']]
+            normalized.append({'points': norm_pts, 'label': p['label'], 'id': p['id']})
+        metadata = {
+            "frame_size": {"width": self.width, "height": self.height},
+            "polygons": [{'label': p['label'], 'id': p['id'], 'points': p['points']} for p in self.polygons],
+            "polygons_normalized": normalized
+        }
+        with open(save_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=4, ensure_ascii=False)
+        messagebox.showinfo("Sucesso", f"Polígonos salvos: {save_path}")
+        self.reset_annotations()
 
     def save_crop(self):
         if not self.crop_rect:
             messagebox.showwarning("Aviso", "Nenhuma área de recorte definida")
             return
         x1, y1, x2, y2 = self.crop_rect
-        cropped = self.display_image.crop((x1, y1, x2, y2))
+        cropped = self.display_image.crop((int(x1), int(y1), int(x2), int(y2)))
         save_path = filedialog.asksaveasfilename(
             initialdir=self.last_save_dir, defaultextension=".png",
             filetypes=[("PNG files", "*.png"), ("JPEG files", "*.jpg;*.jpeg")]
@@ -1034,13 +1293,13 @@ class ImageEditor:
         y2_rel = y2 / self.height
         center_x = (x1_rel + x2_rel) / 2
         center_y = (y1_rel + y2_rel) / 2
-        width = x2_rel - x1_rel
-        height = y2_rel - y1_rel
+        w = x2_rel - x1_rel
+        h = y2_rel - y1_rel
         metadata = {
             "original_size": {"width": self.width, "height": self.height},
             "crop_coordinates_relative": {"x1": x1_rel, "y1": y1_rel, "x2": x2_rel, "y2": y2_rel},
             "crop_coordinates_absolute": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-            "yolo_format": {"center_x": center_x, "center_y": center_y, "width": width, "height": height}
+            "yolo_format": {"center_x": center_x, "center_y": center_y, "width": w, "height": h}
         }
         with open(json_path, 'w') as f:
             json.dump(metadata, f, indent=4)
@@ -1057,22 +1316,22 @@ class ImageEditor:
             return
         base = self.display_image.copy()
         draw = ImageDraw.Draw(base)
-        for poly_data in self.polygons:
-            points = poly_data['points']
-            color = poly_data['color']
-            rgb = tuple(int(color[i:i+2], 16) for i in (1, 3, 5))
-            draw.polygon(points, outline=rgb, width=3)
-            if points:
-                cx = sum(p[0] for p in points) / len(points)
-                cy = sum(p[1] for p in points) / len(points)
+        for p in self.polygons:
+            pts = p['points']
+            color = p['color']
+            rgb = tuple(int(color[i:i+2], 16) for i in (1,3,5))
+            draw.polygon(pts, outline=rgb, width=3)
+            if pts:
+                cx = sum(x for x, y in pts) / len(pts)
+                cy = sum(y for x, y in pts) / len(pts)
                 try:
                     font = ImageFont.truetype("arial.ttf", 16)
                 except:
                     font = ImageFont.load_default()
-                text = f"{poly_data['label']} ({poly_data['id']})"
-                bbox = draw.textbbox((cx, cy), text, font=font)
+                txt = f"{p['label']} ({p['id']})"
+                bbox = draw.textbbox((cx, cy), txt, font=font)
                 draw.rectangle([bbox[0]-2, bbox[1]-2, bbox[2]+2, bbox[3]+2], fill=(0,0,0,128))
-                draw.text((cx, cy), text, font=font, fill=(255,255,255))
+                draw.text((cx, cy), txt, font=font, fill=(255,255,255))
         base.save(save_path)
         self.update_status(f"Imagem exportada: {save_path}")
 
